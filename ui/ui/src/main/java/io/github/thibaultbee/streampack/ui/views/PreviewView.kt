@@ -19,8 +19,10 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.graphics.PointF
 import android.graphics.Rect
+import android.os.Looper
 import android.util.AttributeSet
 import android.util.Size
 import android.view.MotionEvent
@@ -28,6 +30,7 @@ import android.view.ScaleGestureDetector
 import android.view.ScaleGestureDetector.SimpleOnScaleGestureListener
 import android.view.Surface
 import android.view.SurfaceHolder
+import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -75,6 +78,19 @@ class PreviewView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null, defStyle: Int = 0
 ) : FrameLayout(context, attrs, defStyle) {
     private val viewfinder = CameraViewfinder(context, attrs, defStyle)
+
+    /**
+     * Opaque overlay used to hide the last compositor frame when the video source
+     * has no preview (e.g. MediaProjection) or while a new previewable source is
+     * attaching. Must never [Surface.lockCanvas] the producer Surface — that
+     * corrupts BufferQueue format/usage and leaves camera preview permanently black.
+     */
+    private val coverView = View(context).apply {
+        setBackgroundColor(Color.BLACK)
+        visibility = GONE
+        elevation = 1f
+        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
+    }
 
     private var viewfinderSurfaceRequest: ViewfinderSurfaceRequest? = null
 
@@ -160,6 +176,23 @@ class PreviewView @JvmOverloads constructor(
                 LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT
             )
         )
+        addView(
+            coverView, ViewGroup.LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT
+            )
+        )
+    }
+
+    /**
+     * Shows or hides [coverView] on the main thread. Safe from any thread.
+     */
+    private fun setCoverVisible(visible: Boolean) {
+        val visibility = if (visible) VISIBLE else GONE
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            coverView.visibility = visibility
+        } else {
+            post { coverView.visibility = visibility }
+        }
     }
 
     private fun collectSource(
@@ -185,6 +218,11 @@ class PreviewView @JvmOverloads constructor(
                             zoomListener?.let {
                                 registerZoomListener(it)
                             }
+                        } else {
+                            // MediaProjection/SCREEN never paints the viewfinder, so
+                            // cover the last camera frame immediately and keep it
+                            // covered until a previewable source is attached.
+                            setCoverVisible(true)
                         }
                     }
                 }
@@ -426,6 +464,7 @@ class PreviewView @JvmOverloads constructor(
             startPreview(size, videoSource)
         } else {
             Logger.w(TAG, "Video source is not previewable: $videoSource")
+            setCoverVisible(true)
         }
     }
 
@@ -481,6 +520,7 @@ class PreviewView @JvmOverloads constructor(
                 videoSource.startPreview(surface)
             }
             Logger.d(TAG, "Preview started")
+            setCoverVisible(false)
             listener?.onPreviewStarted()
         } catch (t: Throwable) {
             Logger.e(TAG, "Failed to start preview: $t")
