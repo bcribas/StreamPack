@@ -82,8 +82,14 @@ internal constructor(
             if (isVideo) {
                 val bundle = Bundle()
                 bundle.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, value)
-                mediaCodec.setParameters(bundle)
-                field = value
+                try {
+                    mediaCodec.setParameters(bundle)
+                    field = value
+                } catch (e: CodecException) {
+                    Logger.w(tag, "Failed to set bitrate to $value: ${e.message}")
+                } catch (e: IllegalStateException) {
+                    Logger.w(tag, "Failed to set bitrate to $value (codec not in running state): ${e.message}")
+                }
             } else {
                 throw UnsupportedOperationException("Audio encoder does not support bitrate change")
             }
