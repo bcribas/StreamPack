@@ -15,6 +15,8 @@
  */
 package io.github.thibaultbee.streampack.ext.srt.configuration.mediadescriptor
 
+import io.github.thibaultbee.streampack.core.elements.endpoints.composites.muxers.ts.packets.TS
+import io.github.thibaultbee.streampack.core.elements.endpoints.composites.muxers.ts.data.TsPacketizationInfo
 import android.net.Uri
 import io.github.thibaultbee.srtdroid.core.models.SrtUrl
 import io.github.thibaultbee.streampack.core.configuration.mediadescriptor.MediaDescriptor
@@ -85,6 +87,16 @@ fun SrtMediaDescriptor(
     passPhrase: String? = null,
     latency: Int? = null,
     connectionTimeout: Int? = null,
+    /**
+     * `SRTO_MSS`: the largest datagram SRT may send, **including** the IP and UDP headers.
+     * Leave null for the SRT default.
+     */
+    maxSegmentSize: Int? = null,
+    /**
+     * `SRTO_PAYLOADSIZE`. Must be at most [maxSegmentSize] minus 44, and a whole number of
+     * 188-byte TS packets. See [SrtMtu].
+     */
+    payloadSize: Int? = null,
     serviceInfo: TSServiceInfo = createDefaultTsServiceInfo()
 ) = SrtMediaDescriptor(
     SrtUrl(
@@ -125,6 +137,9 @@ fun SrtMediaDescriptor(
         null,
         null,
         null
+    ).copy(
+        maxSegmentSize = maxSegmentSize,
+        payloadSize = payloadSize
     ), serviceInfo
 )
 
@@ -139,8 +154,30 @@ class SrtMediaDescriptor(
     serviceInfo: TSServiceInfo = createDefaultTsServiceInfo()
 ) : MediaDescriptor(
     Type(MediaContainerType.TS, MediaSinkType.SRT),
-    listOf(serviceInfo)
+    // The packetization hint is only attached when a payload size was actually asked for, so a
+    // descriptor built the usual way carries no custom data and the endpoint keeps its default —
+    // today's behaviour, byte for byte.
+    listOfNotNull(
+        serviceInfo,
+        srtUrl.payloadSize?.let {
+            TsPacketizationInfo(SrtMtu.tsPacketsForPayloadSize(it))
+        }
+    )
 ) {
+    init {
+        srtUrl.payloadSize?.let { payloadSize ->
+            require(payloadSize >= TS.PACKET_SIZE) {
+                "SRT payload size must be at least ${TS.PACKET_SIZE}, was $payloadSize"
+            }
+            srtUrl.maxSegmentSize?.let { mss ->
+                require(payloadSize <= mss - SrtMtu.SRT_HEADER_OVERHEAD) {
+                    "SRT payload size $payloadSize does not fit in mss $mss " +
+                            "(needs ${SrtMtu.SRT_HEADER_OVERHEAD} bytes of headers)"
+                }
+            }
+        }
+    }
+
     override val uri: Uri = srtUrl.srtUri.toString().toUri()
 
     /**

@@ -15,6 +15,9 @@
  */
 package io.github.thibaultbee.streampack.core.elements.endpoints.composites
 
+import io.github.thibaultbee.streampack.core.elements.endpoints.composites.muxers.ts.utils.MuxerConst
+import io.github.thibaultbee.streampack.core.elements.endpoints.composites.muxers.ts.data.TsPacketizationInfo
+import io.github.thibaultbee.streampack.core.elements.endpoints.composites.muxers.ts.TsMuxer
 import android.content.Context
 import io.github.thibaultbee.streampack.core.configuration.mediadescriptor.MediaDescriptor
 import io.github.thibaultbee.streampack.core.elements.data.Frame
@@ -70,6 +73,14 @@ open class CompositeEndpoint(
     override val throwableFlow: StateFlow<Throwable?> = MutableStateFlow(null).asStateFlow()
 
     override suspend fun open(descriptor: MediaDescriptor) {
+        // Applied on every open rather than at construction: DynamicEndpoint builds the muxer
+        // reflectively and caches it for the life of the process, so a constructor value would go
+        // stale the moment the user changed the setting between two streams.
+        (muxer as? TsMuxer)?.let { tsMuxer ->
+            tsMuxer.maxOutputPacketNumber =
+                descriptor.getCustomData(TsPacketizationInfo::class.java)?.maxOutputPacketNumber
+                    ?: MuxerConst.MAX_OUTPUT_PACKET_NUMBER
+        }
         sink.open(descriptor)
     }
 

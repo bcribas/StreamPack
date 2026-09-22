@@ -15,6 +15,8 @@
  */
 package io.github.thibaultbee.streampack.ext.srt.elements.endpoints.composites.sinks
 
+import io.github.thibaultbee.streampack.ext.srt.configuration.mediadescriptor.SrtMtu
+import io.github.thibaultbee.streampack.core.elements.endpoints.composites.muxers.ts.packets.TS
 import io.github.thibaultbee.srtdroid.core.enums.Boundary
 import io.github.thibaultbee.srtdroid.core.enums.SockOpt
 import io.github.thibaultbee.srtdroid.core.enums.Transtype
@@ -72,8 +74,14 @@ class SrtSink(private val coroutineDispatcher: CoroutineDispatcher) : AbstractSi
         if (mediaDescriptor.srtUrl.mode != null) {
             require(mediaDescriptor.srtUrl.mode == Mode.CALLER) { "Invalid mode: ${mediaDescriptor.srtUrl.mode}. Only caller supported." }
         }
-        if (mediaDescriptor.srtUrl.payloadSize != null) {
-            require(mediaDescriptor.srtUrl.payloadSize == PAYLOAD_SIZE)
+        val payloadSize = mediaDescriptor.srtUrl.payloadSize ?: PAYLOAD_SIZE
+        require(payloadSize in TS.PACKET_SIZE..SrtMtu.SRT_LIVE_MAX_PAYLOAD_SIZE) {
+            "SRT payload size must be in [${TS.PACKET_SIZE}, ${SrtMtu.SRT_LIVE_MAX_PAYLOAD_SIZE}] but is $payloadSize"
+        }
+        mediaDescriptor.srtUrl.maxSegmentSize?.let { mss ->
+            require(payloadSize <= mss - SrtMtu.SRT_HEADER_OVERHEAD) {
+                "SRT payload size $payloadSize exceeds mss ($mss) - ${SrtMtu.SRT_HEADER_OVERHEAD}"
+            }
         }
         if (mediaDescriptor.srtUrl.transtype != null) {
             require(mediaDescriptor.srtUrl.transtype == Transtype.LIVE)
@@ -81,9 +89,15 @@ class SrtSink(private val coroutineDispatcher: CoroutineDispatcher) : AbstractSi
 
         socket = CoroutineSrtSocket(coroutineDispatcher)
         socket?.let {
-            // Forces this value. Only works if they are null in [srtUrl]
-            it.setSockFlag(SockOpt.PAYLOADSIZE, PAYLOAD_SIZE)
+            // TRANSTYPE first, and that order is load-bearing: setting it to LIVE assigns the
+            // live defaults, payload size among them, so doing it afterwards would silently
+            // overwrite a custom payload with 1316.
             it.setSockFlag(SockOpt.TRANSTYPE, Transtype.LIVE)
+            it.setSockFlag(SockOpt.PAYLOADSIZE, payloadSize)
+            Logger.i(
+                TAG,
+                "SRT open: payloadSize=$payloadSize mss=${mediaDescriptor.srtUrl.maxSegmentSize ?: "default"}"
+            )
             completionException = null
             isOnError = false
             it.socketContext.invokeOnCompletion { t ->

@@ -39,6 +39,20 @@ open class TS(
         const val PACKET_SIZE = 188
     }
 
+    /**
+     * How many TS packets go into one output [io.github.thibaultbee.streampack.core.elements.endpoints.composites.data.Packet].
+     *
+     * Set by the owning muxer. Lower it to emit smaller datagrams on a link with a small path MTU.
+     */
+    @Volatile
+    var maxOutputPacketNumber: Int = MuxerConst.MAX_OUTPUT_PACKET_NUMBER
+        set(value) {
+            require(value in 1..MuxerConst.MAX_OUTPUT_PACKET_NUMBER) {
+                "maxOutputPacketNumber must be in 1..${MuxerConst.MAX_OUTPUT_PACKET_NUMBER}, was $value"
+            }
+            field = value
+        }
+
     protected fun write(
         payload: ByteBuffer? = null,
         adaptationField: ByteBuffer? = null,
@@ -54,7 +68,8 @@ open class TS(
 
         var packetIndicator = 0
 
-        val buffer = byteBufferPool.get(PACKET_SIZE * MuxerConst.MAX_OUTPUT_PACKET_NUMBER)
+        val outputSize = PACKET_SIZE * maxOutputPacketNumber
+        val buffer = byteBufferPool.get(outputSize)
 
         while (payload?.hasRemaining() == true || adaptationFieldIndicator) {
             buffer.limit(buffer.position() + PACKET_SIZE)
@@ -131,7 +146,12 @@ open class TS(
             }
 
             val isLastPacket = payload?.let { !it.hasRemaining() } ?: true
-            if (buffer.limit() == buffer.capacity() || isLastPacket) {
+            // Compared against the size that was asked for, not the buffer's capacity: the pool
+            // hands back any buffer at least that large, so once two sizes coexist — which is
+            // exactly what changing the MTU between two streams does, since the muxer is cached —
+            // a 1316-byte buffer would answer a 940-byte request and this loop would pack seven
+            // packets into it. SRT then rejects a message larger than its payload size.
+            if (buffer.limit() == outputSize || isLastPacket) {
                 writePacket(
                     SrtPacket(
                         buffer,

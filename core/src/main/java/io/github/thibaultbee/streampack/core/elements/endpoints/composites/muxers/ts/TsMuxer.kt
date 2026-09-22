@@ -58,6 +58,23 @@ class TsMuxer : IMuxerInternal {
             field = value
         }
 
+    /**
+     * How many TS packets go into one output datagram.
+     *
+     * Propagated to the tables and elementary streams the same way [listener] is. Only the PES
+     * writes affect real datagram size — PAT, PMT and SDT are single-packet writes that flush on
+     * their last packet regardless — but all four are kept consistent.
+     */
+    var maxOutputPacketNumber: Int = MuxerConst.MAX_OUTPUT_PACKET_NUMBER
+        set(value) {
+            pat.maxOutputPacketNumber = value
+            sdt.maxOutputPacketNumber = value
+            tsPes.forEach { it.maxOutputPacketNumber = value }
+            tsServices.forEach { it.pmt?.maxOutputPacketNumber = value }
+
+            field = value
+        }
+
     private val tsId = Random.nextInt(Byte.MIN_VALUE.toInt(), Byte.MAX_VALUE.toInt()).toShort()
     private var pat = Pat(
         tsBufferPool, listener, tsServices, tsId, packetCount = 0
@@ -359,7 +376,9 @@ class TsMuxer : IMuxerInternal {
         service.pmt = service.pmt?.apply {
             versionNumber = (versionNumber + 1).toByte()
             streams = service.streams
-        } ?: Pmt(tsBufferPool, listener, service, service.streams, getNewPid())
+        } ?: Pmt(tsBufferPool, listener, service, service.streams, getNewPid()).apply {
+            maxOutputPacketNumber = this@TsMuxer.maxOutputPacketNumber
+        }
 
         // Init PES
         newStreams.forEach {
@@ -368,7 +387,9 @@ class TsMuxer : IMuxerInternal {
                 listener,
                 it,
                 service.pcrPid == it.pid,
-            ).run { tsPes.add(this) }
+            ).apply {
+                maxOutputPacketNumber = this@TsMuxer.maxOutputPacketNumber
+            }.run { tsPes.add(this) }
         }
 
         if (isStarted) {
