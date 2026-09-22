@@ -135,6 +135,15 @@ class CompositeVideoSource(
 
     private var videoSourceConfig: VideoSourceConfig? = null
 
+    /**
+     * Whether streaming was actually asked for.
+     *
+     * Distinct from "a child is producing frames": children keep running to feed the preview
+     * after the stream stops, so child activity alone cannot mean the composite is streaming —
+     * nor can a child stopping mean something went wrong.
+     */
+    private var isStreamRequested = false
+
     private var outputSurface: Surface? = null
     private var outputSurfaceOutput: SurfaceOutput? = null
 
@@ -246,7 +255,10 @@ class CompositeVideoSource(
         child.watchJob?.cancel()
         child.watchJob = scope.launch {
             child.source.isStreamingFlow.drop(1).collect { isStreaming ->
-                if (!isStreaming && _isStreamingFlow.value) {
+                // Only unexpected stops are failures. Stopping the stream stops every child by
+                // design, and reporting that as a failure made a normal Stop replace a layer
+                // with the placeholder.
+                if (!isStreaming && isStreamRequested) {
                     Logger.w(TAG, "Layer ${child.layerId} stopped streaming")
                     _layerFailureFlow.tryEmit(
                         LayerFailure(child.layerId, "Source stopped delivering frames")
@@ -265,16 +277,23 @@ class CompositeVideoSource(
      * on a single child hiccup would drop the live stream.
      */
     private fun refreshIsStreaming() {
-        val any = children.values.any { it.source.isStreamingFlow.value }
-        _isStreamingFlow.value = any
+        _isStreamingFlow.value =
+            isStreamRequested && children.values.any { it.source.isStreamingFlow.value }
     }
 
     override suspend fun startStream() {
         childMutex.withLock {
             ensureProcessorUnsafe()
 
+            isStreamRequested = true
+
+            // Re-attach the encoder output that stopStream detached.
+            if (outputSurfaceOutput == null) {
+                outputSurface?.let { attachOutputUnsafe(it) }
+            }
+
             coroutineScope {
-                children.values.map { child ->
+                children.values.filterNot { it.source.isStreamingFlow.value }.map { child ->
                     async {
                         runCatching { child.source.startStream() }
                             .onFailure {
@@ -296,28 +315,64 @@ class CompositeVideoSource(
 
     override suspend fun stopStream() {
         childMutex.withLock {
-            children.values.forEach { child ->
-                runCatching { child.source.stopStream() }
-                    .onFailure { Logger.w(TAG, "Failed to stop layer ${child.layerId}", it) }
-            }
+            isStreamRequested = false
 
-            // Reset each input's timebase converter, mirroring VideoInput.stopStreamUnsafe: it is
-            // what stops the presentation timestamps jumping after the device is locked.
-            val currentProcessor = processor
-            if (currentProcessor != null) {
-                children.values.forEach { child ->
-                    child.inputSurface?.let { surface ->
-                        runCatching { currentProcessor.setTimebase(surface, child.source.timebaseOrUptime()) }
-                    }
-                }
+            /**
+             * Detach the encoder-facing output before anything else.
+             *
+             * MediaCodec.stop() invalidates every output buffer immediately, including ones
+             * already handed to the muxer, so a frame still in flight when the pipeline tears the
+             * encoder down reads freed memory and takes the process with it. Relying on a flag
+             * that the GL thread reads leaves that window open; removing the output closes it,
+             * because the compositor then has nowhere to send a frame at all.
+             */
+            outputSurfaceOutput?.let { output ->
+                processor?.removeOutputSurface(output)
             }
+            outputSurfaceOutput = null
 
             _isStreamingFlow.value = false
+
+            if (_isPreviewingFlow.value) {
+                /**
+                 * A plain camera keeps running when the stream stops, because its preview is a
+                 * separate capture target. The composite's preview is fed by its children through
+                 * the compositor, so stopping them here would freeze the picture on the last
+                 * frame instead of ending the stream.
+                 */
+                Logger.i(TAG, "Stream stopped; children keep running to feed the preview")
+                return@withLock
+            }
+
+            stopChildrenUnsafe()
+        }
+    }
+
+    /**
+     * Requires [childMutex]. Stops every child and rearms its timebase.
+     *
+     * The timebase reset mirrors VideoInput.stopStreamUnsafe: it is what stops presentation
+     * timestamps jumping across the gap, for instance after the device has been locked.
+     */
+    private suspend fun stopChildrenUnsafe() {
+        children.values.forEach { child ->
+            runCatching { child.source.stopStream() }
+                .onFailure { Logger.w(TAG, "Failed to stop layer ${child.layerId}", it) }
+        }
+
+        val currentProcessor = processor ?: return
+        children.values.forEach { child ->
+            child.inputSurface?.let { surface ->
+                runCatching {
+                    currentProcessor.setTimebase(surface, child.source.timebaseOrUptime())
+                }
+            }
         }
     }
 
     override suspend fun release() {
         childMutex.withLock {
+            isStreamRequested = false
             children.values.forEach { child ->
                 child.watchJob?.cancel()
                 runCatching { child.source.release() }
@@ -419,6 +474,12 @@ class CompositeVideoSource(
     override suspend fun stopPreview() {
         childMutex.withLock {
             _isPreviewingFlow.value = false
+
+            // Children were possibly only alive for the preview; stop them if nothing wants them.
+            if (!isStreamRequested) {
+                stopChildrenUnsafe()
+                refreshIsStreaming()
+            }
             previewSurfaceOutput?.let { processor?.removeOutputSurface(it) }
             previewSurfaceOutput = null
         }
