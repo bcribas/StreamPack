@@ -30,6 +30,7 @@ import io.github.thibaultbee.streampack.core.elements.sources.video.IVideoSource
 import io.github.thibaultbee.streampack.core.elements.sources.video.IVideoSourceInternal
 import io.github.thibaultbee.streampack.core.elements.sources.video.VideoSourceConfig
 import io.github.thibaultbee.streampack.core.elements.sources.video.camera.CameraSource
+import io.github.thibaultbee.streampack.core.elements.sources.video.camera.ICameraHoldingSource
 import io.github.thibaultbee.streampack.core.elements.sources.video.camera.CameraSourceFactory
 import io.github.thibaultbee.streampack.core.elements.utils.ConflatedJob
 import io.github.thibaultbee.streampack.core.elements.utils.av.video.DynamicRangeProfile
@@ -173,22 +174,38 @@ internal class VideoInput(
                     return@withContext
                 }
 
-                if ((previousVideoSource is CameraSource) && (videoSourceFactory is CameraSourceFactory)) {
-                    if (previousVideoSource.cameraId == videoSourceFactory.cameraId) {
-                        Logger.i(
-                            TAG,
-                            "Camera id ${previousVideoSource.cameraId} is already set, skipping"
-                        )
-                        return@withContext
-                    }
-
+                if (videoSourceFactory is CameraSourceFactory) {
                     /**
                      * It is not possible to have 2 camera sources at the same time because of
-                     * camera2 API. If the new video source is a camera source and the current one
-                     * is a camera source, we release the current one ASAP.
+                     * camera2 API, so the current one is released ASAP — before the new source
+                     * gets a chance to open the device.
                      */
-                    previousVideoSource.stopStream()
-                    previousVideoSource.release()
+                    if (previousVideoSource is CameraSource) {
+                        if (previousVideoSource.cameraId == videoSourceFactory.cameraId) {
+                            Logger.i(
+                                TAG,
+                                "Camera id ${previousVideoSource.cameraId} is already set, skipping"
+                            )
+                            return@withContext
+                        }
+
+                        previousVideoSource.stopStream()
+                        previousVideoSource.release()
+                    } else if (previousVideoSource is ICameraHoldingSource &&
+                        previousVideoSource.heldCameraIds.contains(videoSourceFactory.cameraId)
+                    ) {
+                        /**
+                         * The previous source is not a camera but holds one open — a composition
+                         * with a camera layer, for instance. It is not a [CameraSource], so the
+                         * check above misses it, and it is only released much later, by which
+                         * time the new camera has already failed to open.
+                         */
+                        Logger.i(
+                            TAG,
+                            "Evicting camera ${videoSourceFactory.cameraId} from $previousVideoSource"
+                        )
+                        previousVideoSource.evictCameras()
+                    }
                 }
 
                 // Prepare new video source

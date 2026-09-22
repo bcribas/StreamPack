@@ -17,6 +17,7 @@
 package io.github.thibaultbee.streampack.core.elements.processing.video
 
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.Rect
 import android.opengl.EGL14
 import android.opengl.EGLConfig
@@ -34,6 +35,7 @@ import androidx.core.graphics.createBitmap
 import androidx.core.util.Pair
 import io.github.thibaultbee.streampack.core.elements.processing.video.outputs.SurfaceOutput
 import io.github.thibaultbee.streampack.core.elements.processing.video.utils.GLUtils.EMPTY_ATTRIBS
+import io.github.thibaultbee.streampack.core.elements.processing.video.utils.GLUtils.IDENTITY_MATRIX
 import io.github.thibaultbee.streampack.core.elements.processing.video.utils.GLUtils.InputFormat
 import io.github.thibaultbee.streampack.core.elements.processing.video.utils.GLUtils.NO_OUTPUT_SURFACE
 import io.github.thibaultbee.streampack.core.elements.processing.video.utils.GLUtils.PIXEL_STRIDE
@@ -90,6 +92,22 @@ class OpenGlRenderer {
     protected var mCurrentInputformat: InputFormat = InputFormat.UNKNOWN
 
     private var mExternalTextureId = -1
+
+    /**
+     * Extra `GL_TEXTURE_EXTERNAL_OES` textures handed out by [createInputTexture], one per
+     * composited input. [mExternalTextureId] is not part of this set.
+     */
+    private val mOwnedTextures = mutableSetOf<Int>()
+
+    /**
+     * Last GL state uploaded by [drawLayer], so the common single-layer case does not re-bind the
+     * texture or re-upload uniforms on every frame. Invalidated whenever the program changes,
+     * because [Program2D.use] resets both uniforms.
+     */
+    private var mBoundTextureId = -1
+    private var mUploadedAlpha = Float.NaN
+    private val mUploadedTransMatrix = FloatArray(16)
+    private var mHasUploadedTransMatrix = false
 
     /**
      * Initializes the OpenGLRenderer
@@ -221,6 +239,46 @@ class OpenGlRenderer {
         }
 
     /**
+     * Creates an additional `GL_TEXTURE_EXTERNAL_OES` texture, owned by this renderer.
+     *
+     * [textureName] returns a single shared texture, which is enough for a one-input processor
+     * but makes several inputs overwrite each other. A compositing processor calls this once per
+     * input instead, so each [android.graphics.SurfaceTexture] gets its own texture.
+     *
+     * @return the new texture name, to be released with [deleteInputTexture].
+     * @throws IllegalStateException if the renderer is not initialized or the caller doesn't run
+     * on the GL thread.
+     */
+    fun createInputTexture(): Int {
+        checkInitializedOrThrow(mInitialized, true)
+        checkGlThreadOrThrow(mGlThread)
+
+        val textureId = createTexture()
+        mOwnedTextures.add(textureId)
+
+        // createTexture() leaves its own texture bound: restore the default binding.
+        activateExternalTexture(mExternalTextureId)
+
+        return textureId
+    }
+
+    /**
+     * Deletes a texture created by [createInputTexture]. Unknown textures are ignored.
+     *
+     * @throws IllegalStateException if the renderer is not initialized or the caller doesn't run
+     * on the GL thread.
+     */
+    fun deleteInputTexture(textureId: Int) {
+        checkInitializedOrThrow(mInitialized, true)
+        checkGlThreadOrThrow(mGlThread)
+
+        if (mOwnedTextures.remove(textureId)) {
+            deleteTexture(textureId)
+            activateExternalTexture(mExternalTextureId)
+        }
+    }
+
+    /**
      * Sets the input format.
      *
      *
@@ -246,21 +304,31 @@ class OpenGlRenderer {
 
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, externalTextureId)
         checkGlErrorOrThrow("glBindTexture")
+
+        mBoundTextureId = externalTextureId
     }
 
     /**
-     * Renders the texture image to the output surface.
+     * Starts a frame on [surface]: makes its EGL surface current, sets the viewport and
+     * optionally clears the whole surface.
      *
+     * Must be paired with [endFrame]. Between the two, call [drawLayer] once per layer.
+     *
+     * @param surface the output surface, previously registered by [registerOutputSurface].
+     * @param viewportRect the viewport to draw into. When `null`, the surface's registered
+     * viewport is used (letterboxing/pillarboxing).
+     * @param clearColor an ARGB color to clear the whole surface with, or `null` to skip the
+     * clear. Clearing is what keeps the area outside [viewportRect] from showing stale buffer
+     * content.
+     * @return `false` when the surface could not be created and nothing should be drawn.
      * @throws IllegalStateException if the renderer is not initialized, the caller doesn't run
-     * on the GL thread or the surface is not registered by
-     * [.registerOutputSurface].
+     * on the GL thread or the surface is not registered by [registerOutputSurface].
      */
-    fun render(
-        timestampNs: Long,
-        textureTransform: FloatArray,
+    fun beginFrame(
         surface: Surface,
-        isMuted: Boolean = false
-    ) {
+        viewportRect: Rect? = null,
+        clearColor: Int? = Color.BLACK
+    ): Boolean {
         checkInitializedOrThrow(mInitialized, true)
         checkGlThreadOrThrow(mGlThread)
 
@@ -270,7 +338,7 @@ class OpenGlRenderer {
         if (outputSurface === NO_OUTPUT_SURFACE) {
             outputSurface = createOutputSurfaceInternal(surface)
             if (outputSurface == null) {
-                return
+                return false
             }
 
             mOutputSurfaceMap[surface] = outputSurface
@@ -282,35 +350,108 @@ class OpenGlRenderer {
         if (surface !== mCurrentSurface) {
             makeCurrent(outputSurface.eglSurface)
             mCurrentSurface = surface
-            GLES20.glViewport(
-                outputSurface.viewPortRect.left,
-                outputSurface.viewPortRect.top,
-                outputSurface.viewPortRect.width(),
-                outputSurface.viewPortRect.height()
-            )
-            GLES20.glScissor(
-                outputSurface.viewPortRect.left,
-                outputSurface.viewPortRect.top,
-                outputSurface.viewPortRect.width(),
-                outputSurface.viewPortRect.height()
-            )
         }
 
+        // The viewport is set on every frame on purpose: the snapshot path also calls
+        // glViewport and other callers may share this context, so caching it on surface
+        // changes alone is not safe.
+        val viewport = viewportRect ?: outputSurface.viewPortRect
+        GLES20.glViewport(
+            viewport.left,
+            viewport.top,
+            viewport.width(),
+            viewport.height()
+        )
 
-        if (isMuted) {
-            GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
+        if (clearColor != null) {
+            // The clear covers the whole surface, not just the viewport: GL_SCISSOR_TEST is
+            // never enabled, so without it the letterbox/pillarbox bars outside the viewport
+            // keep whatever the driver left in the buffer.
+            GLES20.glClearColor(
+                Color.red(clearColor) / 255f,
+                Color.green(clearColor) / 255f,
+                Color.blue(clearColor) / 255f,
+                Color.alpha(clearColor) / 255f
+            )
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-        } else {
-            // TODO(b/245855601): Upload the matrix to GPU when textureTransform is changed.
-            val program: Program2D = requireNotNull(mCurrentProgram)
-            if (program is SamplerShaderProgram) {
-                // Copy the texture transformation matrix over.
-                program.updateTextureMatrix(textureTransform)
-            }
+        }
 
-            // Draw the rect.
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP,  /*firstVertex=*/0,  /*vertexCount=*/4)
-            checkGlErrorOrThrow("glDrawArrays")
+        return true
+    }
+
+    /**
+     * Draws a single textured quad into the frame started by [beginFrame].
+     *
+     * @param externalTextureId the `GL_TEXTURE_EXTERNAL_OES` texture to sample.
+     * @param textureTransform the texture transform matrix (`uTexMatrix`).
+     * @param transformMatrix the geometry matrix (`uTransMatrix`) placing the quad. Identity
+     * fills the whole viewport.
+     * @param alpha the layer opacity, applied through `uAlphaScale`.
+     * @param blend whether to blend this layer over what is already drawn.
+     * @throws IllegalStateException if the renderer is not initialized or the caller doesn't run
+     * on the GL thread.
+     */
+    fun drawLayer(
+        externalTextureId: Int,
+        textureTransform: FloatArray,
+        transformMatrix: FloatArray = IDENTITY_MATRIX,
+        alpha: Float = 1f,
+        blend: Boolean = false
+    ) {
+        checkInitializedOrThrow(mInitialized, true)
+        checkGlThreadOrThrow(mGlThread)
+
+        if (blend) {
+            GLES20.glEnable(GLES20.GL_BLEND)
+            GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+        }
+
+        if (externalTextureId != mBoundTextureId) {
+            activateExternalTexture(externalTextureId)
+        }
+
+        val program: Program2D = requireNotNull(mCurrentProgram)
+        if (program is SamplerShaderProgram) {
+            // TODO(b/245855601): Upload the matrix to GPU when textureTransform is changed.
+            program.updateTextureMatrix(textureTransform)
+        }
+
+        // Program2D.use() resets the transform matrix and the alpha, and it only runs when the
+        // program changes, so neither uniform can be assumed to hold. They are cached rather
+        // than re-uploaded blindly: a single full-frame layer then costs no extra GL call
+        // compared to the pre-compositing renderer.
+        if (!mHasUploadedTransMatrix || !mUploadedTransMatrix.contentEquals(transformMatrix)) {
+            program.updateTransformMatrix(transformMatrix)
+            transformMatrix.copyInto(mUploadedTransMatrix)
+            mHasUploadedTransMatrix = true
+        }
+        if (alpha != mUploadedAlpha) {
+            program.updateAlpha(alpha)
+            mUploadedAlpha = alpha
+        }
+
+        // Draw the rect.
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP,  /*firstVertex=*/0,  /*vertexCount=*/4)
+        checkGlErrorOrThrow("glDrawArrays")
+
+        if (blend) {
+            GLES20.glDisable(GLES20.GL_BLEND)
+        }
+    }
+
+    /**
+     * Timestamps the frame started by [beginFrame] and swaps it to [surface].
+     *
+     * @throws IllegalStateException if the renderer is not initialized, the caller doesn't run
+     * on the GL thread or the surface is not registered by [registerOutputSurface].
+     */
+    fun endFrame(surface: Surface, timestampNs: Long) {
+        checkInitializedOrThrow(mInitialized, true)
+        checkGlThreadOrThrow(mGlThread)
+
+        val outputSurface = getOutSurfaceOrThrow(surface)
+        if (outputSurface === NO_OUTPUT_SURFACE) {
+            return
         }
 
         // Set timestamp
@@ -325,6 +466,32 @@ class OpenGlRenderer {
             )
             removeOutputSurfaceInternal(surface, false)
         }
+    }
+
+    /**
+     * Renders the texture image to the output surface.
+     *
+     * Equivalent to [beginFrame] + a single full-viewport [drawLayer] + [endFrame].
+     *
+     * @throws IllegalStateException if the renderer is not initialized, the caller doesn't run
+     * on the GL thread or the surface is not registered by
+     * [.registerOutputSurface].
+     */
+    fun render(
+        timestampNs: Long,
+        textureTransform: FloatArray,
+        surface: Surface,
+        isMuted: Boolean = false
+    ) {
+        if (!beginFrame(surface, clearColor = Color.BLACK)) {
+            return
+        }
+
+        if (!isMuted) {
+            drawLayer(mExternalTextureId, textureTransform)
+        }
+
+        endFrame(surface, timestampNs)
     }
 
     /**
@@ -437,6 +604,9 @@ class OpenGlRenderer {
         deleteFbo(fbo)
         // Set the external texture to be active.
         activateExternalTexture(mExternalTextureId)
+        // snapshot() uploaded its own texture matrix and moved the viewport.
+        mHasUploadedTransMatrix = false
+        mUploadedAlpha = Float.NaN
     }
 
     // Returns a pair of GL extension (first) and EGL extension (second) strings.
@@ -554,6 +724,9 @@ class OpenGlRenderer {
         if (mCurrentProgram !== program) {
             mCurrentProgram = program
             program.use()
+            // use() resets uTransMatrix to identity and uAlphaScale to 1.0.
+            mHasUploadedTransMatrix = false
+            mUploadedAlpha = Float.NaN
             Log.d(
                 TAG, ("Using program for input format " + mCurrentInputformat + ": "
                         + mCurrentProgram)
@@ -565,6 +738,16 @@ class OpenGlRenderer {
     }
 
     private fun releaseInternal() {
+        // Delete textures handed out by createInputTexture
+        for (textureId in mOwnedTextures) {
+            try {
+                deleteTexture(textureId)
+            } catch (e: RuntimeException) {
+                Logger.w(TAG, "Failed to delete input texture $textureId: ${e.message}", e)
+            }
+        }
+        mOwnedTextures.clear()
+
         // Delete program
         for (program in mProgramHandles.values) {
             program.delete()
@@ -607,6 +790,9 @@ class OpenGlRenderer {
         // Reset other members
         mEglConfig = null
         mExternalTextureId = -1
+        mBoundTextureId = -1
+        mUploadedAlpha = Float.NaN
+        mHasUploadedTransMatrix = false
         mCurrentInputformat = InputFormat.UNKNOWN
         mCurrentSurface = null
         mGlThread = null
