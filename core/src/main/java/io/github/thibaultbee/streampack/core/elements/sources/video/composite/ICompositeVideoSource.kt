@@ -92,6 +92,14 @@ interface ICompositeVideoSource : IVideoSource {
     fun setTargetRotation(@RotationValue targetRotation: Int)
 
     /**
+     * Caps how often the preview is drawn, or `null` to draw it every frame.
+     *
+     * Affects the preview output only: the encoder keeps receiving every frame, so this trades
+     * preview smoothness for GPU and display-composition power without touching what goes out.
+     */
+    var previewMaxFps: Int?
+
+    /**
      * The source behind [layerId], or `null` when there is no such layer.
      *
      * Lets the app talk to one layer's source directly — a USB camera that needs to be told its

@@ -95,6 +95,15 @@ internal class CompositeSurfaceProcessor(
     /** GL thread only. */
     private val surfaceOutputs = mutableListOf<ISurfaceOutput>()
 
+    /**
+     * GL thread only. When each rate-limited output is next due a frame.
+     *
+     * Kept here rather than on the output because [surfaceOutputs] is GL-thread-only by contract,
+     * while a [SurfaceOutput] is constructed on a coroutine and handed over — mutable render
+     * state on it would have no memory-model story.
+     */
+    private val nextOutputFrameNs = java.util.IdentityHashMap<ISurfaceOutput, Long>()
+
     private var lastRenderedTimestampNs = 0L
     private var lastRenderWallClockNs = 0L
 
@@ -328,6 +337,7 @@ internal class CompositeSurfaceProcessor(
 
     private fun removeOutputSurfaceUnsafe(surfaceOutput: ISurfaceOutput) {
         if (surfaceOutputs.remove(surfaceOutput)) {
+            nextOutputFrameNs.remove(surfaceOutput)
             renderer.unregisterOutputSurface(surfaceOutput.targetSurface)
         } else {
             Logger.w(TAG, "Surface not found")
@@ -368,6 +378,7 @@ internal class CompositeSurfaceProcessor(
     private fun removeAllOutputSurfacesUnsafe() {
         surfaceOutputs.forEach { renderer.unregisterOutputSurface(it.targetSurface) }
         surfaceOutputs.clear()
+        nextOutputFrameNs.clear()
     }
 
     override fun removeAllOutputSurfaces() {
@@ -429,9 +440,13 @@ internal class CompositeSurfaceProcessor(
 
         val layout = layoutRef.get()
         val timestampNs = nextTimestampNs(layout)
+        val nowNs = System.nanoTime()
 
         surfaceOutputs.forEach { output ->
             if (output is SurfaceOutput && !output.isStreaming()) {
+                return@forEach
+            }
+            if (!isDueForFrame(output, nowNs)) {
                 return@forEach
             }
             try {
@@ -500,6 +515,37 @@ internal class CompositeSurfaceProcessor(
         }
 
         renderer.endFrame(output.targetSurface, timestampNs)
+    }
+
+    /**
+     * GL thread only. Whether [output] is allowed a frame now.
+     *
+     * An accumulator, not `now - last >= interval`: with a 30 fps source and a 15 fps cap, a plain
+     * elapsed-time test drops a frame whenever jitter puts an arrival a few hundred microseconds
+     * early, and the preview settles at 10 fps instead of 15. Missed slots are skipped the same
+     * way the CFR loop does, so a slow frame cannot cause a burst afterwards.
+     */
+    private fun isDueForFrame(output: ISurfaceOutput, nowNs: Long): Boolean {
+        val intervalNs = output.minFrameIntervalNs
+        if (intervalNs <= 0L) {
+            return true
+        }
+
+        val dueNs = nextOutputFrameNs[output]
+        if (dueNs == null) {
+            nextOutputFrameNs[output] = nowNs + intervalNs
+            return true
+        }
+        if (nowNs < dueNs) {
+            return false
+        }
+
+        var next = dueNs + intervalNs
+        while (next <= nowNs) {
+            next += intervalNs
+        }
+        nextOutputFrameNs[output] = next
+        return true
     }
 
     /**

@@ -56,6 +56,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -93,6 +94,65 @@ class PreviewView @JvmOverloads constructor(
     }
 
     private var viewfinderSurfaceRequest: ViewfinderSurfaceRequest? = null
+
+    /**
+     * Whether the preview is allowed to run.
+     *
+     * Setting it to `false` stops the source producing preview frames and releases the preview
+     * surface, which is the single largest saving available while streaming. **Streaming is not
+     * interrupted**: for a camera the stream is a separate capture target, and for a composition
+     * it is a separate output of the compositor.
+     *
+     * The flag is honoured by [attachToStreamerIfReady], which every internal restart path goes
+     * through, so the preview cannot come back on its own after a window visibility change, a
+     * resize, a rotation or a source swap.
+     */
+    /**
+     * Caps the preview surface to this many pixels on its **shorter** edge, or `null` to keep the
+     * historical full-size behaviour.
+     *
+     * The short edge is used so "540" means the same thing in portrait and in landscape.
+     *
+     * This only changes the size of the surface handed to the video source. This view's own
+     * layout is untouched, which matters: the parent lays it out at the exact stream resolution
+     * deliberately, and resizing it would destroy the SurfaceView's surface.
+     *
+     * The source picks the nearest supported size of the same shape, so the result can be smaller
+     * than the cap when the camera has no size at exactly that height.
+     */
+    var maxPreviewShortEdge: Int? = null
+        set(value) {
+            if (field == value) {
+                return
+            }
+            field = value
+            Logger.i(TAG, "Preview short edge cap is now ${value ?: "off"}")
+            attachToStreamerIfReady(true)
+        }
+
+    var isPreviewEnabled: Boolean = true
+        set(value) {
+            if (field == value) {
+                return
+            }
+            field = value
+            Logger.i(TAG, "Preview ${if (value) "enabled" else "disabled"}")
+
+            if (value) {
+                setCoverVisible(false)
+                attachToStreamerIfReady(true)
+            } else {
+                // The cover hides the last frame. It must never lockCanvas the producer surface.
+                setCoverVisible(true)
+                defaultScope.launch {
+                    try {
+                        stopPreview()
+                    } catch (t: Throwable) {
+                        Logger.e(TAG, "Failed to stop preview", t)
+                    }
+                }
+            }
+        }
 
     /**
      * Enables zoom on pinch gesture.
@@ -309,9 +369,13 @@ class PreviewView @JvmOverloads constructor(
     }
 
     private fun attachToStreamerIfReady(shouldFailSilently: Boolean) {
+        if (!isPreviewEnabled) {
+            Logger.d(TAG, "Preview is disabled, not starting")
+            return
+        }
         if (streamer != null && isAttachedToWindow) {
             try {
-                startPreview(size)
+                startPreview(previewTargetSize())
             } catch (t: Throwable) {
                 if (shouldFailSilently) {
                     // Swallow the exception and fail silently if the method is invoked by View
@@ -452,6 +516,27 @@ class PreviewView @JvmOverloads constructor(
         }
         touchUpEvent = null
         return super.performClick()
+    }
+
+    /**
+     * The view size, scaled down so its shorter edge fits [maxPreviewShortEdge].
+     *
+     * Only a hint: the source still chooses a size it actually supports.
+     */
+    private fun previewTargetSize(): Size {
+        val viewSize = size
+        val limit = maxPreviewShortEdge ?: return viewSize
+
+        val shortEdge = minOf(viewSize.width, viewSize.height)
+        if (shortEdge <= 0 || shortEdge <= limit) {
+            return viewSize
+        }
+
+        val scale = limit.toFloat() / shortEdge
+        return Size(
+            (viewSize.width * scale).roundToInt().coerceAtLeast(2),
+            (viewSize.height * scale).roundToInt().coerceAtLeast(2)
+        )
     }
 
     /**

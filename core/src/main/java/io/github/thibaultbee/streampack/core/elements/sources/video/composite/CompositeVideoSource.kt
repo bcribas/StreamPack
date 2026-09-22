@@ -56,6 +56,7 @@ import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.math.roundToInt
 
 /**
  * One layer of a composition: where it goes, and what feeds it.
@@ -154,6 +155,23 @@ class CompositeVideoSource(
      * Seeded from the display because [configure] needs the canvas orientation before the
      * pipeline ever reports a target rotation.
      */
+    /**
+     * Outputs are immutable, so a change only takes effect when the preview is re-attached.
+     */
+    override var previewMaxFps: Int? = null
+        set(value) {
+            if (field == value) {
+                return
+            }
+            field = value
+            Logger.i(TAG, "Preview frame rate cap is now ${value ?: "off"}")
+            scope.launch {
+                childMutex.withLock {
+                    previewSurface?.let { attachPreviewUnsafe(it) }
+                }
+            }
+        }
+
     @RotationValue
     private var targetRotation: Int = context.displayRotation
 
@@ -494,7 +512,45 @@ class CompositeVideoSource(
         }
     }
 
-    override fun <T> getPreviewSize(targetSize: Size, targetClass: Class<T>): Size = canvasSize
+    /**
+     * The canvas, shrunk to fit [targetSize] but never enlarged, keeping the canvas shape exactly.
+     *
+     * Same shape matters: [attachPreviewUnsafe] uses this as the output's target resolution, and
+     * because the canvas info provider reports the canvas size with zero relative rotation,
+     * `calculateViewportRect` then lands on its equal-aspect branch and gives the full surface —
+     * no letterbox, and layer geometry untouched.
+     *
+     * The answer is remembered because [io.github.thibaultbee.streampack.ui.views.PreviewView]
+     * asks for it immediately before requesting a surface of exactly this size and handing it to
+     * [setPreview].
+     */
+    override fun <T> getPreviewSize(targetSize: Size, targetClass: Class<T>): Size {
+        val canvas = canvasSize
+        if (targetSize.width <= 0 || targetSize.height <= 0) {
+            return canvas.also { previewResolution = it }
+        }
+
+        val scale = minOf(
+            targetSize.width.toFloat() / canvas.width,
+            targetSize.height.toFloat() / canvas.height
+        )
+        if (scale >= 1f) {
+            return canvas.also { previewResolution = it }
+        }
+
+        // Even dimensions: an odd one leaves a one-pixel seam at a layer edge.
+        fun even(value: Float) = value.roundToInt().coerceAtLeast(2) and 1.inv()
+        val scaled = Size(even(canvas.width * scale), even(canvas.height * scale))
+        Logger.i(TAG, "Preview canvas $canvas scaled to $scaled for target $targetSize")
+        return scaled.also { previewResolution = it }
+    }
+
+    /**
+     * What [getPreviewSize] last answered. Written from the caller thread, read when the preview
+     * output is built.
+     */
+    @Volatile
+    private var previewResolution: Size = DEFAULT_RESOLUTION
 
     /**
      * Requires [childMutex].
@@ -505,12 +561,15 @@ class CompositeVideoSource(
 
         val output = SurfaceOutput(
             targetSurface = surface,
-            targetResolution = canvasSize,
+            // The preview surface may be smaller than the canvas; the content is still
+            // canvas-sized, which is why sourceResolution below stays the canvas.
+            targetResolution = previewResolution,
             targetRotation = 0,
             isStreaming = { _isPreviewingFlow.value },
             sourceResolution = canvasSize,
             needMirroring = false,
-            sourceInfoProvider = internalInfoProvider
+            sourceInfoProvider = internalInfoProvider,
+            maxFps = previewMaxFps
         )
         currentProcessor.addOutputSurface(output)
         previewSurfaceOutput = output

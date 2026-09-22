@@ -184,11 +184,15 @@ internal class CameraSource(
 
 
     override fun <T> getPreviewSize(targetSize: Size, targetClass: Class<T>): Size {
-        return CameraSizes.getPreviewOutputSize(
+        val chosen = CameraSizes.getPreviewOutputSizeForAspect(
             manager.getCameraCharacteristics(cameraId),
             targetSize,
             targetClass
         )
+        // Logged because a device with no supported size of the requested shape silently gets a
+        // bigger preview than asked for, and that is invisible otherwise.
+        Logger.i(TAG, "Preview size for target $targetSize: $chosen")
+        return chosen
     }
 
     @RequiresPermission(Manifest.permission.CAMERA)
