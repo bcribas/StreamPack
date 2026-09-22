@@ -51,7 +51,9 @@ fun CompositionLayout.applyPreset(preset: LayoutPreset): CompositionLayout {
     val newLayers = ordered.mapIndexed { index, layer ->
         val slot = preset.slots.getOrNull(index)
         if (slot == null) {
-            layer.copy(visible = false)
+            // Also park it full-frame. Keeping the old rectangle meant a later swap moved the
+            // visible layer into a stale inset rectangle, which looked like the swap was broken.
+            layer.copy(visible = false, rect = LayerRect.FULL)
         } else {
             layer.copy(
                 rect = slot.rect,
@@ -73,6 +75,10 @@ fun CompositionLayout.applyPreset(preset: LayoutPreset): CompositionLayout {
 fun CompositionLayout.swapLayerOrder(firstId: String, secondId: String): CompositionLayout {
     val first = get(firstId) ?: return this
     val second = get(secondId) ?: return this
+    if (!first.visible || !second.visible) {
+        // Swapping with something that is not on screen just makes the visible layer vanish.
+        return this
+    }
     return copy(
         layers = layers.map {
             when (it.id) {
@@ -83,6 +89,32 @@ fun CompositionLayout.swapLayerOrder(firstId: String, secondId: String): Composi
         }
     )
 }
+
+/**
+ * Which of [presets] this layout currently matches, or null after a manual drag.
+ *
+ * Derived rather than stored: the layout is the immutable contract the GL thread consumes, and a
+ * preset id kept inside it would have to be invalidated by every drag, snap and resize -- easy to
+ * get wrong, and wrong in the direction of lying to the operator. The slot rectangles are exact
+ * constants, so an exact-ish comparison is reliable; the drag snap only lands on edges and centre.
+ */
+fun CompositionLayout.matchingPreset(presets: List<LayoutPreset>): LayoutPreset? {
+    val visible = layers.filter { it.visible }.sortedBy { it.z }
+    return presets.firstOrNull { preset ->
+        preset.slots.size == visible.size &&
+                visible.zip(preset.slots).all { (layer, slot) ->
+                    layer.scaleMode == slot.scaleMode && layer.rect.matches(slot.rect)
+                }
+    }
+}
+
+private fun LayerRect.matches(other: LayerRect): Boolean {
+    fun near(a: Float, b: Float) = kotlin.math.abs(a - b) <= PRESET_MATCH_TOLERANCE
+    return near(left, other.left) && near(top, other.top) &&
+            near(right, other.right) && near(bottom, other.bottom)
+}
+
+private const val PRESET_MATCH_TOLERANCE = 1e-3f
 
 /**
  * The arrangements shipped with the library.
