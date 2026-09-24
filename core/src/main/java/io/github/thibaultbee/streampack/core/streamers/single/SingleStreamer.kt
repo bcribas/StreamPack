@@ -42,6 +42,7 @@ import io.github.thibaultbee.streampack.core.interfaces.setCameraId
 import io.github.thibaultbee.streampack.core.pipelines.DispatcherProvider
 import io.github.thibaultbee.streampack.core.pipelines.IDispatcherProvider
 import io.github.thibaultbee.streampack.core.pipelines.StreamerPipeline
+import io.github.thibaultbee.streampack.core.pipelines.outputs.encoding.IConfigurableAudioVideoEncodingPipelineOutput
 import io.github.thibaultbee.streampack.core.pipelines.inputs.IAudioInput
 import io.github.thibaultbee.streampack.core.pipelines.inputs.IVideoInput
 import io.github.thibaultbee.streampack.core.regulator.controllers.IBitrateRegulatorController
@@ -211,7 +212,7 @@ class SingleStreamer(
     @RotationValue defaultRotation: Int = context.displayRotation,
     surfaceProcessorFactory: ISurfaceProcessorInternal.Factory = DefaultSurfaceProcessorFactory(),
     dispatcherProvider: IDispatcherProvider = DispatcherProvider(),
-) : ISingleStreamer, IAudioSingleStreamer, IVideoSingleStreamer {
+) : ISingleStreamer, IAudioSingleStreamer, IVideoSingleStreamer, ISecondaryOutputStreamer {
     private val streamer = SingleStreamerImpl(
         context = context,
         withAudio = true,
@@ -226,6 +227,7 @@ class SingleStreamer(
     override val throwableFlow = streamer.throwableFlow
     override val isOpenFlow = streamer.isOpenFlow
     override val isStreamingFlow = streamer.isStreamingFlow
+    override val isPipelineStreamingFlow = streamer.isPipelineStreamingFlow
 
     override val endpoint: IEndpoint
         get() = streamer.endpoint
@@ -268,6 +270,16 @@ class SingleStreamer(
     override suspend fun stopStream() = streamer.stopStream()
 
     override suspend fun release() = streamer.release()
+
+    override suspend fun addSecondaryOutput(
+        endpointFactory: IEndpointInternal.Factory,
+        withAudio: Boolean,
+        withVideo: Boolean,
+        @RotationValue targetRotation: Int?
+    ) = streamer.addSecondaryOutput(endpointFactory, withAudio, withVideo, targetRotation)
+
+    override suspend fun removeSecondaryOutput(output: IConfigurableAudioVideoEncodingPipelineOutput) =
+        streamer.removeSecondaryOutput(output)
 
     override var bitrateRegulatorControllerFactory: IBitrateRegulatorController.Factory?
         get() = streamer.bitrateRegulatorControllerFactory

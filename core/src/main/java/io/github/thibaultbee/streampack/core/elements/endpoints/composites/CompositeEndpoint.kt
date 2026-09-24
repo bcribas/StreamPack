@@ -27,6 +27,7 @@ import io.github.thibaultbee.streampack.core.elements.endpoints.IEndpointInterna
 import io.github.thibaultbee.streampack.core.elements.endpoints.composites.data.Packet
 import io.github.thibaultbee.streampack.core.elements.endpoints.composites.muxers.IMuxer
 import io.github.thibaultbee.streampack.core.elements.endpoints.composites.muxers.IMuxerInternal
+import io.github.thibaultbee.streampack.core.elements.endpoints.composites.sinks.IRandomAccessPointAware
 import io.github.thibaultbee.streampack.core.elements.endpoints.composites.sinks.ISinkInternal
 import io.github.thibaultbee.streampack.core.elements.endpoints.composites.sinks.ISinkWithMetricsInternal
 import io.github.thibaultbee.streampack.core.elements.endpoints.composites.sinks.SinkConfiguration
@@ -63,6 +64,10 @@ open class CompositeEndpoint(
                 runBlocking {
                     sink.write(packet)
                 }
+            }
+
+            override fun onRandomAccessPoint(ptsInUs: Long) {
+                (sink as? IRandomAccessPointAware)?.onRandomAccessPoint(ptsInUs)
             }
         }
     }

@@ -509,7 +509,7 @@ open class StreamerPipeline(
                     jobs += it
                 }
                 if (output is IConfigurableVideoPipelineOutputInternal) {
-                    addConfigurableVideoOutput(output)
+                    jobs += addConfigurableVideoOutput(output)
                 }
             } else {
                 Logger.w(TAG, "Pipeline has no video")
@@ -656,10 +656,11 @@ open class StreamerPipeline(
 
     private fun addConfigurableVideoOutput(
         output: IConfigurableVideoPipelineOutputInternal
-    ) {
+    ): Job {
         require(output.videoSourceConfigFlow.value == null) { "Output $output already have a video source config" }
-        // Catch the config invalidation
-        coroutineScope.launch {
+        // Catch the config invalidation. Returned so removeOutput cancels it with the output's
+        // other jobs, as the audio one already was; it used to outlive every removed output.
+        val job = coroutineScope.launch {
             output.videoSourceConfigFlow.drop(1).collect { sourceConfig ->
                 if (sourceConfig == null) {
                     withContextInputMutex {
@@ -685,6 +686,32 @@ open class StreamerPipeline(
                         setVideoSourceConfig(buildVideoSourceConfig(output, newVideoSourceConfig))
                     }
             }
+
+        return job
+    }
+
+    /**
+     * Recomputes the source configurations from the outputs still attached, for example after
+     * removing one that needed a bigger resolution than the others.
+     *
+     * The sources cannot be reconfigured while they stream, so it then leaves them as they are
+     * (logged) until the next configuration change.
+     */
+    internal suspend fun refreshSourceConfigs() = withContextInputMutex {
+        if (withVideo) {
+            try {
+                setVideoSourceConfig(buildVideoSourceConfig())
+            } catch (t: Throwable) {
+                Logger.w(TAG, "refreshSourceConfigs: video source config kept: ${t.message}")
+            }
+        }
+        if (withAudio) {
+            try {
+                setAudioSourceConfig(buildAudioSourceConfig())
+            } catch (t: Throwable) {
+                Logger.w(TAG, "refreshSourceConfigs: audio source config kept: ${t.message}")
+            }
+        }
     }
 
     /**

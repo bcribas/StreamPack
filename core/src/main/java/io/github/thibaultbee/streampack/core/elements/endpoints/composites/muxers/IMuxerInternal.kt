@@ -30,6 +30,16 @@ interface IMuxerInternal :
 
     interface IMuxerListener {
         fun onOutputFrame(packet: Packet)
+
+        /**
+         * Called when the next output starts a random access point: a video key frame, which the
+         * TS muxer precedes with a fresh PAT and PMT. Called before any byte of it is output, on
+         * the muxing thread, so a listener can start a new file there and have that file open
+         * cleanly.
+         *
+         * @param ptsInUs presentation timestamp of the key frame
+         */
+        fun onRandomAccessPoint(ptsInUs: Long) {}
     }
 
     fun write(frame: Frame, streamPid: Int)

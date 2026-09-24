@@ -46,11 +46,15 @@ import kotlinx.coroutines.sync.withLock
  * An implementation of [IEndpointInternal] where the endpoint is created based on the [MediaDescriptor].
  *
  * @param context The application context
+ * @param srtEndpointOverride called on every [open] of an SRT descriptor; the endpoint it returns
+ * is used instead of the built-in SRT endpoint, and null falls back to the built-in one. It must
+ * set up its own muxer: unlike the built-in one, it is opened as it is.
  */
 open class DynamicEndpoint(
     private val context: Context,
     private val defaultDispatcher: CoroutineDispatcher,
-    private val ioDispatcher: CoroutineDispatcher
+    private val ioDispatcher: CoroutineDispatcher,
+    private val srtEndpointOverride: ((MediaDescriptor) -> IEndpointInternal?)? = null
 ) : IEndpointInternal, WithEndpointMetrics<Any> {
     private val coroutineScope = CoroutineScope(defaultDispatcher)
     private val mutex = Mutex()
@@ -96,8 +100,12 @@ open class DynamicEndpoint(
                 if (isOpenFlow == null) {
                     isOpenJob.cancel()
                 } else {
-                    isOpenJob += isOpenFlow.collect { isOpen ->
-                        _isOpenFlow.emit(isOpen)
+                    // Launched: collecting in place never returned, so this mirrored the first
+                    // endpoint ever opened for the life of the process, whatever came after it.
+                    isOpenJob += launch {
+                        isOpenFlow.collect { isOpen ->
+                            _isOpenFlow.emit(isOpen)
+                        }
                     }
                 }
             }
@@ -177,6 +185,9 @@ open class DynamicEndpoint(
     }
 
     private fun prepareEndpoint(mediaDescriptor: MediaDescriptor): IEndpointInternal {
+        if (mediaDescriptor.type.sinkType == MediaSinkType.SRT) {
+            srtEndpointOverride?.invoke(mediaDescriptor)?.let { return it }
+        }
         val endpoint = getEndpoint(mediaDescriptor.type)
 
         if (endpoint is io.github.thibaultbee.streampack.core.elements.endpoints.composites.ICompositeEndpoint) {
@@ -275,14 +286,19 @@ open class DynamicEndpoint(
 
 /**
  * A factory to build a [DynamicEndpoint].
+ *
+ * @param srtEndpointOverride see [DynamicEndpoint]
  */
-class DynamicEndpointFactory : IEndpointInternal.Factory {
+class DynamicEndpointFactory(
+    private val srtEndpointOverride: ((MediaDescriptor) -> IEndpointInternal?)? = null
+) : IEndpointInternal.Factory {
     override fun create(
         context: Context,
         dispatcherProvider: IDispatcherProvider
     ): IEndpointInternal = DynamicEndpoint(
         context,
         dispatcherProvider.default,
-        dispatcherProvider.io
+        dispatcherProvider.io,
+        srtEndpointOverride
     )
 }

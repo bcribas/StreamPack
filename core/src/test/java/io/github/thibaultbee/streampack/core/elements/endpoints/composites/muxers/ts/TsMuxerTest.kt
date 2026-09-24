@@ -19,6 +19,9 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import io.github.thibaultbee.streampack.core.elements.encoders.AudioCodecConfig
 import io.github.thibaultbee.streampack.core.elements.encoders.VideoCodecConfig
+import io.github.thibaultbee.streampack.core.elements.endpoints.composites.data.Packet
+import io.github.thibaultbee.streampack.core.elements.endpoints.composites.muxers.IMuxerInternal
+import io.github.thibaultbee.streampack.core.elements.endpoints.composites.muxers.ts.data.TSServiceInfo
 import io.github.thibaultbee.streampack.core.elements.endpoints.composites.muxers.ts.utils.TSConst
 import io.github.thibaultbee.streampack.core.elements.endpoints.composites.muxers.ts.utils.Utils.createFakeServiceInfo
 import io.github.thibaultbee.streampack.core.elements.utils.FakeFrameFactory
@@ -256,5 +259,72 @@ class TsMuxerTest {
         tsMux.write(
             FakeFrameFactory.create(mimeType = MediaFormat.MIMETYPE_AUDIO_AAC), streamPid
         )
+    }
+
+    @Test
+    fun `random access point comes before the PAT of a video key frame, and only then`() {
+        val videoConfig = VideoCodecConfig(
+            mimeType = MediaFormat.MIMETYPE_VIDEO_AVC,
+            resolution = MockUtils.mockSize(1280, 720),
+            profile = MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline,
+            level = MediaCodecInfo.CodecProfileLevel.AVCLevel31
+        )
+        val audioConfig = AudioCodecConfig(mimeType = MediaFormat.MIMETYPE_AUDIO_AAC)
+        val service = createFakeServiceInfo()
+        val tsMux = TsMuxer().apply { addService(service) }
+        val pids = tsMux.addStreams(service, listOf(videoConfig, audioConfig))
+
+        val events = mutableListOf<String>()
+        tsMux.listener = object : IMuxerInternal.IMuxerListener {
+            override fun onOutputFrame(packet: Packet) {
+                val buffer = packet.buffer
+                val pid = ((buffer.get(buffer.position() + 1).toInt() and 0x1F) shl 8) or
+                        (buffer.get(buffer.position() + 2).toInt() and 0xFF)
+                events += when (pid) {
+                    0x0000 -> "PAT"
+                    0x0011 -> "SDT"
+                    else -> "data"
+                }
+            }
+
+            override fun onRandomAccessPoint(ptsInUs: Long) {
+                events += "RAP"
+            }
+        }
+
+        // An audio frame flagged as key frame and a video delta frame start nothing
+        tsMux.write(
+            FakeFrameFactory.create(MediaFormat.MIMETYPE_AUDIO_AAC, isKeyFrame = true),
+            pids[audioConfig]!!
+        )
+        tsMux.write(
+            FakeFrameFactory.create(MediaFormat.MIMETYPE_VIDEO_AVC, isKeyFrame = false),
+            pids[videoConfig]!!
+        )
+        assertFalse(events.contains("RAP"))
+
+        tsMux.write(
+            FakeFrameFactory.create(MediaFormat.MIMETYPE_VIDEO_AVC, isKeyFrame = true),
+            pids[videoConfig]!!
+        )
+        assertEquals(1, events.count { it == "RAP" })
+        val afterRap = events.drop(events.indexOf("RAP") + 1).filter { it != "SDT" }
+        assertEquals("PAT", afterRap.first())
+    }
+
+    @Test
+    fun `remove every service`() {
+        val tsMux = TsMuxer().apply {
+            addService(createFakeServiceInfo())
+            addService(
+                TSServiceInfo(
+                    TSServiceInfo.ServiceType.DIGITAL_TV, 0x4699, "Second", "ProviderName"
+                )
+            )
+        }
+
+        tsMux.removeServices()
+
+        assertTrue(tsMux.getServices().isEmpty())
     }
 }

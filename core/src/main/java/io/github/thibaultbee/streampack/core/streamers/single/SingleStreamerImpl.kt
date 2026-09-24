@@ -36,18 +36,27 @@ import io.github.thibaultbee.streampack.core.pipelines.IDispatcherProvider
 import io.github.thibaultbee.streampack.core.pipelines.StreamerPipeline
 import io.github.thibaultbee.streampack.core.pipelines.inputs.IAudioInput
 import io.github.thibaultbee.streampack.core.pipelines.inputs.IVideoInput
+import io.github.thibaultbee.streampack.core.pipelines.outputs.IVideoPipelineOutputInternal
 import io.github.thibaultbee.streampack.core.pipelines.outputs.encoding.IEncodingPipelineOutputInternal
 import io.github.thibaultbee.streampack.core.pipelines.outputs.encoding.EncodingPipelineOutput
 import io.github.thibaultbee.streampack.core.regulator.controllers.IBitrateRegulatorController
 import io.github.thibaultbee.streampack.core.streamers.infos.CameraStreamerConfigurationInfo
 import io.github.thibaultbee.streampack.core.streamers.infos.IConfigurationInfo
 import io.github.thibaultbee.streampack.core.streamers.infos.StreamerConfigurationInfo
+import io.github.thibaultbee.streampack.core.logger.Logger
+import io.github.thibaultbee.streampack.core.pipelines.outputs.encoding.IConfigurableAudioVideoEncodingPipelineOutput
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
@@ -71,7 +80,7 @@ internal class SingleStreamerImpl(
     @RotationValue defaultRotation: Int = context.displayRotation,
     surfaceProcessorFactory: ISurfaceProcessorInternal.Factory = DefaultSurfaceProcessorFactory(),
     dispatcherProvider: IDispatcherProvider = DispatcherProvider(),
-) : ISingleStreamer, IAudioSingleStreamer, IVideoSingleStreamer {
+) : ISingleStreamer, IAudioSingleStreamer, IVideoSingleStreamer, ISecondaryOutputStreamer {
     private val coroutineScope: CoroutineScope = CoroutineScope(dispatcherProvider.default)
 
     private val pipeline = StreamerPipeline(
@@ -106,7 +115,44 @@ internal class SingleStreamerImpl(
     override val isOpenFlow: StateFlow<Boolean>
         get() = pipelineOutput.isOpenFlow
 
-    override val isStreamingFlow: StateFlow<Boolean> = pipeline.isStreamingFlow
+    /**
+     * The secondary outputs added through [addSecondaryOutput]. Guarded by [secondaryMutex].
+     */
+    private val secondaryOutputs = mutableListOf<IConfigurableAudioVideoEncodingPipelineOutput>()
+    private val secondaryMutex = Mutex()
+
+    @Volatile
+    private var hasSecondaryOutputs = false
+
+    private val _isStreamingFlow = MutableStateFlow(false)
+
+    /**
+     * Whether the live, the main output, is streaming.
+     *
+     * With no secondary output it is exactly the pipeline's own state, as it always was. With
+     * one, the sources keep running for it while the main output is stopped, so it also requires
+     * the main output to be streaming.
+     */
+    override val isStreamingFlow: StateFlow<Boolean> = _isStreamingFlow.asStateFlow()
+
+    override val isPipelineStreamingFlow: StateFlow<Boolean> = pipeline.isStreamingFlow
+
+    private fun refreshIsStreaming() {
+        _isStreamingFlow.value = if (hasSecondaryOutputs) {
+            pipeline.isStreamingFlow.value && pipelineOutput.isStreamingFlow.value
+        } else {
+            pipeline.isStreamingFlow.value
+        }
+    }
+
+    init {
+        // Unconfined, so the state follows its sources on their own thread, as it did when it
+        // was the pipeline's flow itself; startStream and stopStream also refresh it on return.
+        coroutineScope.launch(Dispatchers.Unconfined) {
+            combine(pipeline.isStreamingFlow, pipelineOutput.isStreamingFlow) { _, _ -> }
+                .collect { refreshIsStreaming() }
+        }
+    }
 
     // AUDIO
     /**
@@ -259,7 +305,11 @@ internal class SingleStreamerImpl(
      */
     override suspend fun startStream() {
         initJob.join()
-        pipelineOutput.startStream()
+        try {
+            pipelineOutput.startStream()
+        } finally {
+            refreshIsStreaming()
+        }
     }
 
     /**
@@ -268,11 +318,69 @@ internal class SingleStreamerImpl(
      * Internally, it resets audio and video recorders and encoders to get them ready for another
      * [startStream] session. It explains why preview could be restarted.
      *
+     * While a secondary output is streaming, only the main output is stopped: the sources keep
+     * running for the secondary one.
+     *
      * @see [startStream]
      */
     override suspend fun stopStream() {
         initJob.join()
-        pipeline.stopStream()
+        try {
+            val secondaryStreaming = secondaryMutex.withLock {
+                secondaryOutputs.any { it.isStreamingFlow.value }
+            }
+            if (secondaryStreaming) {
+                pipelineOutput.stopStream()
+            } else {
+                pipeline.stopStream()
+            }
+        } finally {
+            refreshIsStreaming()
+        }
+    }
+
+    override suspend fun addSecondaryOutput(
+        endpointFactory: IEndpointInternal.Factory,
+        withAudio: Boolean,
+        withVideo: Boolean,
+        @RotationValue targetRotation: Int?
+    ): IConfigurableAudioVideoEncodingPipelineOutput {
+        initJob.join()
+        return secondaryMutex.withLock {
+            val output = pipeline.createEncodingOutput(
+                withAudio = withAudio,
+                withVideo = withVideo,
+                endpointFactory = endpointFactory,
+                targetRotation = targetRotation
+                    ?: (pipelineOutput as IVideoPipelineOutputInternal).targetRotation
+            )
+            secondaryOutputs += output
+            hasSecondaryOutputs = true
+            output
+        }.also { refreshIsStreaming() }
+    }
+
+    override suspend fun removeSecondaryOutput(output: IConfigurableAudioVideoEncodingPipelineOutput) {
+        initJob.join()
+        require(output !== pipelineOutput) { "The main output is not a secondary output" }
+        secondaryMutex.withLock {
+            if (!secondaryOutputs.remove(output)) {
+                Logger.w(TAG, "removeSecondaryOutput: $output is not a secondary output")
+                return
+            }
+            runCatching { output.stopStream() }
+                .onFailure { Logger.w(TAG, "removeSecondaryOutput: stop failed: ${it.message}") }
+            runCatching { output.close() }
+                .onFailure { Logger.w(TAG, "removeSecondaryOutput: close failed: ${it.message}") }
+            runCatching { pipeline.removeOutput(output) }
+                .onFailure { Logger.w(TAG, "removeSecondaryOutput: detach failed: ${it.message}") }
+            runCatching { output.release() }
+                .onFailure { Logger.w(TAG, "removeSecondaryOutput: release failed: ${it.message}") }
+            hasSecondaryOutputs = secondaryOutputs.isNotEmpty()
+            // Back to the main output's resolution, when the sources are idle enough to allow it.
+            pipeline.refreshSourceConfigs()
+        }
+        refreshIsStreaming()
     }
 
     /**

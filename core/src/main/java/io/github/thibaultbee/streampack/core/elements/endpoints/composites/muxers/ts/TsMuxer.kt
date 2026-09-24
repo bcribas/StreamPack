@@ -197,7 +197,11 @@ class TsMuxer : IMuxerInternal {
     private fun generateStreams(
         frame: Frame, pes: Pes
     ) {
-        retransmitPsi(pes.stream.isVideo and frame.isKeyFrame)
+        val isRandomAccessPoint = pes.stream.isVideo and frame.isKeyFrame
+        if (isRandomAccessPoint) {
+            listener?.onRandomAccessPoint(frame.ptsInUs)
+        }
+        retransmitPsi(isRandomAccessPoint)
         pes.write(frame)
     }
 
@@ -310,7 +314,8 @@ class TsMuxer : IMuxerInternal {
      * Removes all services and their streams
      */
     fun removeServices() {
-        tsServices.forEach {
+        // A copy: removeService removes from tsServices, which must not happen mid-iteration.
+        tsServices.toList().forEach {
             removeService(it)
         }
     }
