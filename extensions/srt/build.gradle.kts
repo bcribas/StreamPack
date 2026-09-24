@@ -8,6 +8,10 @@ description = "Secure Reliable Transport (SRT) extension for StreamPack."
 
 android {
     namespace = "io.github.thibaultbee.streampack.ext.srt"
+    testOptions {
+        // JVM tests reach the logger, which uses android.util.Log
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {

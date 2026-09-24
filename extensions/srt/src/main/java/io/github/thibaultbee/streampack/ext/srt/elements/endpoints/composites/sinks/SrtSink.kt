@@ -42,7 +42,17 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.IOException
 
-class SrtSink(private val coroutineDispatcher: CoroutineDispatcher) : AbstractSink(),
+/**
+ * @param closeOnWriteError whether a failed send closes the socket right there, on the muxing
+ * thread, which can take up to 2 s. An owner that closes the sink itself, off that thread, turns
+ * it off: the sink then only reports the failure.
+ *
+ * Overloaded for the JVM: the core builds it by reflection with the dispatcher alone.
+ */
+class SrtSink @JvmOverloads constructor(
+    private val coroutineDispatcher: CoroutineDispatcher,
+    private val closeOnWriteError: Boolean = true
+) : AbstractSink(),
     ISinkWithMetricsInternal<SrtRawMetrics> {
     override val supportedSinkTypes: List<MediaSinkType> = listOf(MediaSinkType.SRT)
 
@@ -71,21 +81,7 @@ class SrtSink(private val coroutineDispatcher: CoroutineDispatcher) : AbstractSi
         open(SrtMediaDescriptor(mediaDescriptor))
 
     private suspend fun open(mediaDescriptor: SrtMediaDescriptor) {
-        if (mediaDescriptor.srtUrl.mode != null) {
-            require(mediaDescriptor.srtUrl.mode == Mode.CALLER) { "Invalid mode: ${mediaDescriptor.srtUrl.mode}. Only caller supported." }
-        }
-        val payloadSize = mediaDescriptor.srtUrl.payloadSize ?: PAYLOAD_SIZE
-        require(payloadSize in TS.PACKET_SIZE..SrtMtu.SRT_LIVE_MAX_PAYLOAD_SIZE) {
-            "SRT payload size must be in [${TS.PACKET_SIZE}, ${SrtMtu.SRT_LIVE_MAX_PAYLOAD_SIZE}] but is $payloadSize"
-        }
-        mediaDescriptor.srtUrl.maxSegmentSize?.let { mss ->
-            require(payloadSize <= mss - SrtMtu.SRT_HEADER_OVERHEAD) {
-                "SRT payload size $payloadSize exceeds mss ($mss) - ${SrtMtu.SRT_HEADER_OVERHEAD}"
-            }
-        }
-        if (mediaDescriptor.srtUrl.transtype != null) {
-            require(mediaDescriptor.srtUrl.transtype == Transtype.LIVE)
-        }
+        val payloadSize = validate(mediaDescriptor)
 
         socket = CoroutineSrtSocket(coroutineDispatcher)
         socket?.let {
@@ -190,7 +186,9 @@ class SrtSink(private val coroutineDispatcher: CoroutineDispatcher) : AbstractSi
                 // Socket already closed
                 throw ClosedException(completionException!!)
             }
-            close()
+            if (closeOnWriteError) {
+                close()
+            }
             throw ClosedException(t)
         }
     }
@@ -229,5 +227,30 @@ class SrtSink(private val coroutineDispatcher: CoroutineDispatcher) : AbstractSi
         private const val TAG = "SrtSink"
 
         private const val PAYLOAD_SIZE = 1316
+
+        /**
+         * Checks what can be checked without the network: caller mode, live transtype, and a
+         * payload that fits the MSS. Throws on a configuration that can never connect.
+         *
+         * @return the payload size to use
+         */
+        fun validate(mediaDescriptor: SrtMediaDescriptor): Int {
+            if (mediaDescriptor.srtUrl.mode != null) {
+                require(mediaDescriptor.srtUrl.mode == Mode.CALLER) { "Invalid mode: ${mediaDescriptor.srtUrl.mode}. Only caller supported." }
+            }
+            val payloadSize = mediaDescriptor.srtUrl.payloadSize ?: PAYLOAD_SIZE
+            require(payloadSize in TS.PACKET_SIZE..SrtMtu.SRT_LIVE_MAX_PAYLOAD_SIZE) {
+                "SRT payload size must be in [${TS.PACKET_SIZE}, ${SrtMtu.SRT_LIVE_MAX_PAYLOAD_SIZE}] but is $payloadSize"
+            }
+            mediaDescriptor.srtUrl.maxSegmentSize?.let { mss ->
+                require(payloadSize <= mss - SrtMtu.SRT_HEADER_OVERHEAD) {
+                    "SRT payload size $payloadSize exceeds mss ($mss) - ${SrtMtu.SRT_HEADER_OVERHEAD}"
+                }
+            }
+            if (mediaDescriptor.srtUrl.transtype != null) {
+                require(mediaDescriptor.srtUrl.transtype == Transtype.LIVE)
+            }
+            return payloadSize
+        }
     }
 }
