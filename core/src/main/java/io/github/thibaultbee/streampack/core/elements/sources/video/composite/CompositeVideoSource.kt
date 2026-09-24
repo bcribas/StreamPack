@@ -783,6 +783,11 @@ class CompositeVideoSource(
                 runCatching { child.source.startStream() }
                     .onFailure {
                         Logger.e(TAG, "Failed to start replacement for layer $layerId", it)
+                        // Reported like a source that fails to be created, so the app can put
+                        // something else in the layer instead of leaving it blank
+                        _layerFailureFlow.tryEmit(
+                            LayerFailure(layerId, it.message ?: "Failed to start the new source")
+                        )
                     }
             }
             refreshIsStreaming()
