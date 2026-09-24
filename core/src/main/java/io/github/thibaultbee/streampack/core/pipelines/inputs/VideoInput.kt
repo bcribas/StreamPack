@@ -17,6 +17,7 @@ package io.github.thibaultbee.streampack.core.pipelines.inputs
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.util.Size
 import android.view.Surface
 import androidx.annotation.IntRange
 import io.github.thibaultbee.streampack.core.elements.interfaces.ISnapshotable
@@ -99,6 +100,25 @@ interface IVideoInput : ISnapshotable {
      * The video processor for adding effects to the video frames.
      */
     val processor: ISurfaceProcessorInternal
+
+    /**
+     * Adds a surface that receives the picture the live's encoder gets, at [size], oriented like
+     * it, and drawn only on the frames where [isStreaming] returns true: a reader that wants one
+     * frame a second costs one small draw a second.
+     *
+     * Unlike a surface added to [processor] directly, it is kept when the outputs are rebuilt (a
+     * new source, rotation or resolution). Remove it with [removeExtraOutputSurface].
+     */
+    suspend fun addExtraOutputSurface(surface: Surface, size: Size, isStreaming: () -> Boolean)
+
+    suspend fun removeExtraOutputSurface(surface: Surface)
+
+    /**
+     * The size the live's encoder takes frames at, rotation applied (a portrait live is taller
+     * than wide, whatever its configuration says); null without an encoder yet. What a surface
+     * added with [addExtraOutputSurface] should be shaped like.
+     */
+    suspend fun encoderOutputSize(): Size?
 }
 
 /**
@@ -124,6 +144,11 @@ internal class VideoInput(
     private var isReleaseRequested = AtomicBoolean(false)
 
     private val sourceMutex = Mutex()
+
+    private class ExtraOutput(val surface: Surface, val size: Size, val isStreaming: () -> Boolean)
+
+    /** Surfaces added with [addExtraOutputSurface]. Under [sourceMutex]. */
+    private val extraOutputs = mutableListOf<ExtraOutput>()
 
     override var processor: ISurfaceProcessorInternal =
         surfaceProcessorFactory.create(dynamicRangeProfileHint, dispatcherProvider)
@@ -545,6 +570,70 @@ internal class VideoInput(
                     isStreaming
                 )
             )
+        }
+        extraOutputs.forEach { addExtraOutputSurfaceUnsafe(it, surfaces, infoProvider, videoSourceConfig) }
+    }
+
+    /** Oriented and mirrored like the first encoder output: the picture as it goes out. */
+    private fun addExtraOutputSurfaceUnsafe(
+        extra: ExtraOutput,
+        surfaces: List<Triple<SurfaceDescriptor, Boolean, () -> Boolean>>,
+        infoProvider: ISourceInfoProvider,
+        videoSourceConfig: VideoSourceConfig
+    ) {
+        val encoder = surfaces.firstOrNull { it.first.isEncoderInputSurface } ?: surfaces.firstOrNull()
+        // Framed as for the encoder's own size: a source (a camera) sizes its picture for the
+        // target it is asked about, and for a small surface picks another shape, which would be
+        // letterboxed into it instead of matching what goes out
+        val framedLike = encoder?.first?.resolution
+        val provider = if (framedLike == null) infoProvider else object : ISourceInfoProvider by infoProvider {
+            override fun getSurfaceSize(targetResolution: Size): Size = infoProvider.getSurfaceSize(framedLike)
+        }
+        addOutputSurfaceUnsafe(
+            buildSurfaceOutput(
+                provider,
+                videoSourceConfig,
+                SurfaceDescriptor(extra.surface, extra.size, encoder?.first?.targetRotation ?: 0),
+                encoder?.second ?: false,
+                extra.isStreaming
+            )
+        )
+    }
+
+    override suspend fun addExtraOutputSurface(surface: Surface, size: Size, isStreaming: () -> Boolean) {
+        if (isReleaseRequested.get()) {
+            throw IllegalStateException("Input is released")
+        }
+        withContext(dispatcherProvider.default) {
+            sourceMutex.withLock {
+                extraOutputs.firstOrNull { it.surface == surface }?.let {
+                    extraOutputs.remove(it)
+                    processor.removeOutputSurface(surface)
+                }
+                val extra = ExtraOutput(surface, size, isStreaming)
+                extraOutputs.add(extra)
+                val sourceConfig = sourceConfig
+                val infoProvider = source?.infoProviderFlow?.value
+                // Without a configured source it is added with the other outputs, later
+                if ((sourceConfig != null) && (infoProvider != null)) {
+                    addExtraOutputSurfaceUnsafe(extra, onUpdateOutputSurface(), infoProvider, sourceConfig)
+                }
+            }
+        }
+    }
+
+    override suspend fun encoderOutputSize(): Size? {
+        val surfaces = onUpdateOutputSurface()
+        return (surfaces.firstOrNull { it.first.isEncoderInputSurface } ?: surfaces.firstOrNull())?.first?.resolution
+    }
+
+    override suspend fun removeExtraOutputSurface(surface: Surface) {
+        withContext(dispatcherProvider.default) {
+            sourceMutex.withLock {
+                if (extraOutputs.removeAll { it.surface == surface } && !isReleaseRequested.get()) {
+                    processor.removeOutputSurface(surface)
+                }
+            }
         }
     }
 
