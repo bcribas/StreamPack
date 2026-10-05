@@ -33,6 +33,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
@@ -73,7 +75,15 @@ class ResilientSrtEndpointTest {
     private class FakeSink(
         private val onOpen: suspend () -> Unit = {},
         var failWrites: Boolean = false,
+        /** A send that waits until the sink is closed, like a socket that takes nothing. */
+        var hangWrites: Boolean = false,
     ) : ISinkInternal {
+        /** What the server has answered so far, for the stall watch. */
+        val answers = java.util.concurrent.atomic.AtomicLong(0)
+
+        /** False: the socket takes datagrams but the server answers nothing. */
+        @Volatile
+        var answering = true
         val written: MutableList<String> = Collections.synchronizedList(mutableListOf())
         override val isOpenFlow = MutableStateFlow(false)
 
@@ -83,7 +93,14 @@ class ResilientSrtEndpointTest {
         }
 
         override suspend fun write(packet: Packet): Int {
+            // As the SRT socket does: srtdroid sends from direct buffers only
+            require(packet.buffer.isDirect) { "msg must be a direct ByteBuffer" }
             if (failWrites) throw IOException("Connection was broken")
+            if (hangWrites) {
+                isOpenFlow.first { !it }
+                throw IOException("Socket closed")
+            }
+            if (answering) answers.incrementAndGet()
             val b = packet.buffer
             written += "${b.get(b.position())}:${b.get(b.position() + 1)}:${b.get(b.position() + 2)}"
             return b.remaining()
@@ -94,6 +111,15 @@ class ResilientSrtEndpointTest {
         override suspend fun stopStream() = Unit
         override suspend fun close() {
             isOpenFlow.value = false
+        }
+    }
+
+    /** Sends nothing until [gate] opens, like a socket whose buffer is full. */
+    private class GatedSink(private val inner: FakeSink, private val gate: CompletableDeferred<Unit>) :
+        ISinkInternal by inner {
+        override suspend fun write(packet: Packet): Int {
+            gate.await()
+            return inner.write(packet)
         }
     }
 
@@ -125,7 +151,12 @@ class ResilientSrtEndpointTest {
         override fun close() = Unit
     }
 
-    private fun endpoint(sinks: () -> ISinkInternal, backoff: List<Long> = listOf(20, 20)) =
+    private fun endpoint(
+        sinks: () -> ISinkInternal,
+        backoff: List<Long> = listOf(20, 20),
+        stallTimeoutMs: Long = 60_000,
+        maxQueuedBytes: Long = 4L shl 20,
+    ) =
         ResilientSrtEndpoint(
             ioDispatcher = Dispatchers.IO,
             sinkFactory = sinks,
@@ -134,7 +165,18 @@ class ResilientSrtEndpointTest {
             firstAttemptWaitMs = 500,
             backoffMs = backoff,
             sinkCloseTimeoutMs = 500,
+            stallTimeoutMs = stallTimeoutMs,
+            stallCheckMs = 50,
+            maxQueuedBytes = maxQueuedBytes,
+            peerAnswers = { (it as? FakeSink)?.answers?.get() },
         )
+
+    /** What [sink] got, once the sender has caught up with [count] datagrams. */
+    private suspend fun FakeSink.awaitWritten(count: Int): List<String> =
+        withTimeout(3_000) {
+            while (written.size < count) kotlinx.coroutines.delay(5)
+            written.toList()
+        }
 
     private suspend fun ResilientSrtEndpoint.awaitState(predicate: (SrtLinkState) -> Boolean) =
         withTimeout(3_000) { linkStateFlow.first(predicate) }
@@ -213,7 +255,109 @@ class ResilientSrtEndpointTest {
         endpoint.write(frame(4, key = true), VIDEO)
         endpoint.write(frame(5), AUDIO)
 
-        assertEquals(listOf("1:1:4", "2:0:5"), sinks[0].written.toList())
+        assertEquals(listOf("1:1:4", "2:0:5"), sinks[0].awaitWritten(2))
+        endpoint.close()
+    }
+
+    @Test
+    fun `a socket that takes nothing holds up neither encoder, and the link is replaced`() = runBlocking {
+        val sinks = mutableListOf<FakeSink>()
+        val endpoint = endpoint({ FakeSink(hangWrites = sinks.isEmpty()).also { sinks += it } }, stallTimeoutMs = 300)
+        endpoint.open(descriptor)
+        endpoint.startStream()
+        endpoint.awaitState { it == SrtLinkState.Connected(1) }
+
+        val start = System.nanoTime()
+        endpoint.write(frame(1, key = true), VIDEO)
+        repeat(50) { endpoint.write(frame(it + 2L), if (it % 2 == 0) AUDIO else VIDEO) }
+        val elapsedMs = (System.nanoTime() - start) / 1_000_000
+        // Writing used to wait on the socket, with the lock that the other encoder needs
+        assertTrue("the encoders waited $elapsedMs ms", elapsedMs < 200)
+
+        endpoint.awaitState { it == SrtLinkState.Connected(2) }
+        endpoint.write(frame(100, key = true), VIDEO)
+        assertEquals(listOf("1:1:100"), sinks[1].awaitWritten(1))
+        endpoint.close()
+    }
+
+    @Test
+    fun `a link the server stopped answering is replaced`() = runBlocking {
+        val sinks = mutableListOf<FakeSink>()
+        val endpoint = endpoint({ FakeSink().also { sinks += it } }, stallTimeoutMs = 300)
+        endpoint.open(descriptor)
+        endpoint.startStream()
+        endpoint.awaitState { it == SrtLinkState.Connected(1) }
+        endpoint.write(frame(1, key = true), VIDEO)
+        sinks[0].awaitWritten(1)
+
+        // The socket keeps taking datagrams, but nothing comes back
+        sinks[0].answering = false
+        val feeder = launch(Dispatchers.IO) {
+            var pts = 2L
+            while (isActive) {
+                endpoint.write(frame(pts++), AUDIO)
+                kotlinx.coroutines.delay(10)
+            }
+        }
+        val state = endpoint.awaitState { it is SrtLinkState.Connecting && it.everConnected }
+        assertEquals("No answer from the server for 300 ms", (state as SrtLinkState.Connecting).lastError)
+        endpoint.awaitState { it == SrtLinkState.Connected(2) }
+        feeder.cancel()
+        endpoint.close()
+    }
+
+    @Test
+    fun `with nothing to send, a quiet server is not a stall`() = runBlocking {
+        val sinks = mutableListOf<FakeSink>()
+        val endpoint = endpoint({ FakeSink().also { sinks += it } }, stallTimeoutMs = 200)
+        endpoint.open(descriptor)
+        endpoint.startStream()
+        endpoint.awaitState { it == SrtLinkState.Connected(1) }
+        kotlinx.coroutines.delay(800)
+        assertEquals(SrtLinkState.Connected(1), endpoint.linkStateFlow.value)
+        endpoint.close()
+    }
+
+    @Test
+    fun `a full queue drops to the next key frame, which starts clean`() = runBlocking {
+        val gate = CompletableDeferred<Unit>()
+        var keyFramesRequested = 0
+        val sinks = mutableListOf<FakeSink>()
+        val endpoint = endpoint(
+            { GatedSink(FakeSink().also { sinks += it }, gate) },
+            maxQueuedBytes = 3 * 4
+        )
+        endpoint.keyFrameRequester = { keyFramesRequested++ }
+        endpoint.open(descriptor)
+        endpoint.startStream()
+        endpoint.awaitState { it == SrtLinkState.Connected(1) }
+        assertEquals(1, keyFramesRequested)
+
+        endpoint.write(frame(1, key = true), VIDEO) // taken by the sender, which waits
+        endpoint.write(frame(2), VIDEO)
+        endpoint.write(frame(3), VIDEO)
+        endpoint.write(frame(4), VIDEO)
+        endpoint.write(frame(5), VIDEO) // the queue is full: dropped
+        endpoint.write(frame(6), AUDIO) // still dropped, waiting for a key frame
+        assertEquals("one asked for at the drop", 2, keyFramesRequested)
+        gate.complete(Unit)
+        sinks[0].awaitWritten(4)
+        endpoint.write(frame(7, key = true), VIDEO)
+        endpoint.write(frame(8), AUDIO)
+
+        assertEquals(listOf("1:1:1", "1:0:2", "1:0:3", "1:0:4", "1:1:7", "2:0:8"), sinks[0].awaitWritten(6))
+        assertTrue(endpoint.bytesDropped > 0)
+        endpoint.close()
+    }
+
+    @Test
+    fun `a new network replaces a connected link at once`() = runBlocking {
+        val endpoint = endpoint({ FakeSink() })
+        endpoint.open(descriptor)
+        endpoint.startStream()
+        endpoint.awaitState { it == SrtLinkState.Connected(1) }
+        endpoint.networkChanged()
+        endpoint.awaitState { it == SrtLinkState.Connected(2) }
         endpoint.close()
     }
 

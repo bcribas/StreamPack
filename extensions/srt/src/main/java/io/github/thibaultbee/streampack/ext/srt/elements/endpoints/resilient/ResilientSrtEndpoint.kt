@@ -23,6 +23,7 @@ import io.github.thibaultbee.streampack.core.elements.endpoints.IEndpoint
 import io.github.thibaultbee.streampack.core.elements.endpoints.IEndpointInternal
 import io.github.thibaultbee.streampack.core.elements.endpoints.composites.CompositeEndpoint
 import io.github.thibaultbee.streampack.core.elements.endpoints.composites.data.Packet
+import io.github.thibaultbee.streampack.core.elements.endpoints.composites.data.SrtPacket
 import io.github.thibaultbee.streampack.core.elements.endpoints.composites.muxers.IMuxerInternal
 import io.github.thibaultbee.streampack.core.elements.endpoints.composites.muxers.ts.TsMuxer
 import io.github.thibaultbee.streampack.core.elements.endpoints.composites.muxers.ts.data.TSServiceInfo
@@ -44,6 +45,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -56,11 +59,12 @@ import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * The state of the network leg of a [ResilientSrtEndpoint].
@@ -104,6 +108,17 @@ sealed interface SrtLinkState {
  * reconnection nothing goes to the socket until the next video key frame, so the new session
  * starts where a player can; [keyFrameRequester] is asked for one right away.
  *
+ * The encoders never wait for the network. The muxer's output is queued and one sender per
+ * connection writes it to the socket: a socket that cannot keep up used to hold the muxer's lock
+ * for seconds at a time, and with it both encoders, so the picture went down to a few frames a
+ * second and nothing went out. When the queue is full the rest waits for the next key frame,
+ * where the receiver picks up cleanly.
+ *
+ * A link that is connected but not flowing is replaced: no datagram accepted by the socket, or no
+ * answer from the server, for [stallTimeoutMs] while there was something to send. That is what
+ * a router switching provider looks like: the old path keeps the socket "connected" and only a
+ * new socket, on a new port, goes out the new way. [networkChanged] does the same at once.
+ *
  * @param sinkFactory a new SRT sink for every connection attempt
  * @param muxer the muxer; a [TsMuxer] is set up with the descriptor's service on every open
  * @param validator throws for a descriptor that can never connect
@@ -116,6 +131,15 @@ class ResilientSrtEndpoint(
     private val firstAttemptWaitMs: Long = 3_500,
     private val backoffMs: List<Long> = listOf(500, 1_000, 2_000, 3_000, 5_000),
     private val sinkCloseTimeoutMs: Long = 2_000,
+    /** A connected link with nothing accepted or confirmed for this long, while sending, is replaced. */
+    private val stallTimeoutMs: Long = 8_000,
+    private val stallCheckMs: Long = 1_000,
+    /** Bytes waiting for the socket beyond which the rest waits for the next key frame. */
+    private val maxQueuedBytes: Long = 4L shl 20,
+    /** How many answers the server has sent on [ISinkInternal] so far (SRT ACKs), or null if unknown. */
+    private val peerAnswers: (ISinkInternal) -> Long? = { sink ->
+        (sink as? SrtSink)?.let { runCatching { it.metrics.packetsReadACK.toLong() }.getOrNull() }
+    },
 ) : IEndpointInternal, WithEndpointMetrics<Any> {
 
     private val scope = CoroutineScope(SupervisorJob() + ioDispatcher)
@@ -129,9 +153,15 @@ class ResilientSrtEndpoint(
 
     @Volatile
     private var liveSink: ISinkInternal? = null
+
+    /** The queue of the connection in [liveSink]; set and cleared with it, under [muxLock]. */
+    private var outbox: Outbox? = null
     private var awaitingKeyFrame = true
     private var writingKeyFrame = false
     private var keyFrameRejected = false
+
+    /** The queue overflowed: a key frame is asked for once the muxer's lock is released. */
+    private var keyFrameWanted = false
     private var streamStarted = false
 
     private val failures = Channel<String>(Channel.CONFLATED)
@@ -182,6 +212,35 @@ class ResilientSrtEndpoint(
         retrySignal.trySend(Unit)
     }
 
+    /**
+     * The phone moved to another network: the socket stays on the old one, so a connected link is
+     * replaced at once rather than after it stalls.
+     */
+    fun networkChanged() {
+        if (liveSink != null) failures.trySend("The network changed")
+        retryNow()
+    }
+
+    private val droppedBytes = AtomicLong(0)
+
+    /** Bytes the network could not take in time and that were dropped, since the endpoint was created. */
+    val bytesDropped: Long get() = droppedBytes.get()
+
+    /** One connection's queue, drained by its sender. */
+    private class Outbox {
+        val queue = Channel<Outgoing>(Channel.UNLIMITED)
+        val queuedBytes = AtomicLong(0)
+
+        /** Bytes the muxer wanted to send on this connection, queued or dropped. */
+        val demandBytes = AtomicLong(0)
+
+        /** Bytes the socket accepted. */
+        val acceptedBytes = AtomicLong(0)
+    }
+
+    /** A datagram on its way; [opensGate] when it is part of the key frame the session starts on. */
+    private class Outgoing(val packet: Packet, val opensGate: Boolean)
+
     override suspend fun open(descriptor: MediaDescriptor) {
         if (_isOpenFlow.value) {
             Logger.w(TAG, "Already opened")
@@ -223,6 +282,7 @@ class ResilientSrtEndpoint(
                 sink.open(descriptor)
                 // A connect that ignored a close() must not publish its socket afterwards
                 currentCoroutineContext().ensureActive()
+                val box = Outbox()
                 sinkMutex.withLock {
                     if (streamStarted) {
                         sink.configure(SinkConfiguration(synchronized(muxLock) { muxer.streamConfigs }))
@@ -231,9 +291,11 @@ class ResilientSrtEndpoint(
                     while (failures.tryReceive().isSuccess) Unit
                     synchronized(muxLock) {
                         awaitingKeyFrame = true
+                        outbox = box
                         liveSink = sink
                     }
                 }
+                val sender = scope.launch { send(sink, box) }
                 everConnected = true
                 failedAttempts = 0
                 epoch++
@@ -242,10 +304,15 @@ class ResilientSrtEndpoint(
                 Logger.i(TAG, "SRT link up (connection $epoch)")
                 keyFrameRequester?.let { runCatching { it() } }
 
-                lastError = merge(
-                    failures.receiveAsFlow(),
-                    sink.isOpenFlow.filter { !it }.map { "Connection closed" }
-                ).first()
+                try {
+                    lastError = merge(
+                        failures.receiveAsFlow(),
+                        sink.isOpenFlow.filter { !it }.map { "Connection closed" },
+                        stalls(sink, box)
+                    ).first()
+                } finally {
+                    sender.cancel()
+                }
                 Logger.w(TAG, "SRT link down: $lastError")
             } catch (e: CancellationException) {
                 throw e
@@ -255,9 +322,12 @@ class ResilientSrtEndpoint(
                 Logger.w(TAG, "SRT connection attempt $failedAttempts failed: $lastError")
                 firstAttempt.complete(Unit)
             } finally {
+                // Nothing may go to this sink any more, then it closes: a send still waiting on it
+                // wakes up with an error instead of waiting for a socket nobody will close
                 synchronized(muxLock) {
                     if (liveSink === sink) {
                         liveSink = null
+                        outbox = null
                         awaitingKeyFrame = true
                     }
                 }
@@ -270,20 +340,122 @@ class ResilientSrtEndpoint(
         }
     }
 
-    /** Muxer output: to the tap always, to the socket while connected and past a key frame. */
+    /**
+     * Muxer output, with [muxLock] held: to the tap always, to the queue while connected and past
+     * a key frame. Never waits for the network.
+     */
     private fun deliver(packet: Packet) {
         tsTap?.let { tap -> runCatching { tap.onTsPackets(packet.buffer) } }
-        val sink = liveSink ?: return
+        val box = outbox ?: return
         if (awaitingKeyFrame && !writingKeyFrame) return
-        try {
-            val written = runBlocking { sink.write(packet) }
+        val size = packet.buffer.remaining().toLong()
+        box.demandBytes.addAndGet(size)
+        if (box.queuedBytes.get() + size > maxQueuedBytes) {
+            // The socket cannot keep up: what is queued still goes, the rest waits for a key frame
+            droppedBytes.addAndGet(size)
+            if (!awaitingKeyFrame) {
+                awaitingKeyFrame = true
+                keyFrameWanted = true
+                Logger.w(TAG, "The network cannot keep up: dropping to the next key frame")
+            }
+            if (writingKeyFrame) keyFrameRejected = true
+            return
+        }
+        box.queuedBytes.addAndGet(size)
+        box.queue.trySend(Outgoing(copyOf(packet), opensGate = awaitingKeyFrame && writingKeyFrame))
+    }
+
+    /**
+     * The muxer reuses its buffers once the listener returns: a queued datagram is a copy, in a
+     * direct buffer as the SRT socket requires, taken from [spareBuffers] when one is there.
+     */
+    private fun copyOf(packet: Packet): Packet {
+        val source = packet.buffer.duplicate()
+        val size = source.remaining()
+        val copy = (spareBuffers.poll()?.takeIf { it.capacity() >= size } ?: ByteBuffer.allocateDirect(
+            maxOf(size, DATAGRAM_CAPACITY)
+        )).apply {
+            clear()
+            put(source)
+            flip()
+        }
+        return if (packet is SrtPacket) {
+            SrtPacket(copy, packet.isFirstPacketFrame, packet.isLastPacketFrame, packet.ts)
+        } else {
+            Packet(copy, packet.ts)
+        }
+    }
+
+    /** Direct buffers back from the socket, for the next copies: allocating them is slow. */
+    private val spareBuffers = java.util.concurrent.ConcurrentLinkedQueue<ByteBuffer>()
+
+    private fun recycle(buffer: ByteBuffer) {
+        if (buffer.isDirect && buffer.capacity() == DATAGRAM_CAPACITY && spareBuffers.size < MAX_SPARE_BUFFERS) {
+            spareBuffers.offer(buffer)
+        }
+    }
+
+    /** Drains [box] into [sink] until the connection ends. */
+    private suspend fun send(sink: ISinkInternal, box: Outbox) {
+        for (outgoing in box.queue) {
+            val size = outgoing.packet.buffer.remaining().toLong()
+            val written = try {
+                sink.write(outgoing.packet)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                failures.trySend(t.message ?: t.javaClass.simpleName)
+                return
+            } finally {
+                box.queuedBytes.addAndGet(-size)
+                recycle(outgoing.packet.buffer)
+            }
+            box.acceptedBytes.addAndGet(size)
             // The sink drops what predates its connection; a dropped key frame must not open the
-            // gate, or the receiver would start mid-GOP.
-            if (written < 0 && writingKeyFrame) keyFrameRejected = true
-        } catch (t: Throwable) {
-            liveSink = null
-            awaitingKeyFrame = true
-            failures.trySend(t.message ?: t.javaClass.simpleName)
+            // gate, or the receiver would start mid-GOP
+            if (written < 0 && outgoing.opensGate) {
+                synchronized(muxLock) { if (outbox === box) awaitingKeyFrame = true }
+                while (true) {
+                    val stale = box.queue.tryReceive().getOrNull() ?: break
+                    box.queuedBytes.addAndGet(-stale.packet.buffer.remaining().toLong())
+                    recycle(stale.packet.buffer)
+                }
+                keyFrameRequester?.let { runCatching { it() } }
+            }
+        }
+    }
+
+    /**
+     * Emits why the link is stalled: nothing accepted by the socket, or no answer from the
+     * server, for [stallTimeoutMs] while there was something to send.
+     */
+    private fun stalls(sink: ISinkInternal, box: Outbox) = flow {
+        var lastAccepted = box.acceptedBytes.get()
+        var lastAnswers = peerAnswers(sink)
+        var lastDemand = box.demandBytes.get()
+        var acceptedAt = System.nanoTime()
+        var answeredAt = acceptedAt
+        while (true) {
+            delay(stallCheckMs)
+            val now = System.nanoTime()
+            val demand = box.demandBytes.get()
+            val wanted = demand != lastDemand || box.queuedBytes.get() > 0
+            lastDemand = demand
+            val accepted = box.acceptedBytes.get()
+            if (accepted != lastAccepted || !wanted) {
+                lastAccepted = accepted
+                acceptedAt = now
+            }
+            val answers = peerAnswers(sink)
+            if (answers == null || answers != lastAnswers || !wanted) {
+                lastAnswers = answers
+                answeredAt = now
+            }
+            val limitNs = stallTimeoutMs * 1_000_000
+            when {
+                now - acceptedAt >= limitNs -> emit("The socket took nothing for ${duration(stallTimeoutMs)}")
+                now - answeredAt >= limitNs -> emit("No answer from the server for ${duration(stallTimeoutMs)}")
+            }
         }
     }
 
@@ -295,10 +467,14 @@ class ResilientSrtEndpoint(
             try {
                 muxer.write(frame, streamPid)
             } finally {
-                if (writingKeyFrame && awaitingKeyFrame && liveSink != null) {
+                if (writingKeyFrame && awaitingKeyFrame && outbox != null) {
                     if (keyFrameRejected) askForKeyFrame = true else awaitingKeyFrame = false
                 }
                 writingKeyFrame = false
+                if (keyFrameWanted) {
+                    keyFrameWanted = false
+                    askForKeyFrame = true
+                }
             }
         }
         if (askForKeyFrame) keyFrameRequester?.let { runCatching { it() } }
@@ -342,11 +518,22 @@ class ResilientSrtEndpoint(
         loopJob = null
         job?.cancel()
         withTimeoutOrNull(sinkCloseTimeoutMs + 500) { job?.join() }
-        synchronized(muxLock) { liveSink = null }
+        synchronized(muxLock) {
+            liveSink = null
+            outbox = null
+        }
         _linkStateFlow.value = SrtLinkState.Idle
     }
 
     private companion object {
         const val TAG = "ResilientSrtEndpoint"
+
+        fun duration(ms: Long) = if (ms % 1000 == 0L) "${ms / 1000} s" else "$ms ms"
+
+        /** Room for any datagram: SRT's payload is at most 1456 bytes. */
+        const val DATAGRAM_CAPACITY = 1500
+
+        /** About 2 MB of spare direct buffers at most. */
+        const val MAX_SPARE_BUFFERS = 1400
     }
 }
