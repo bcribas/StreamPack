@@ -33,7 +33,12 @@ data class LayoutSlot(
 data class LayoutPreset(
     val id: String,
     val name: String,
-    val slots: List<LayoutSlot>
+    val slots: List<LayoutSlot>,
+    /**
+     * A picture-in-picture corner: an inset the operator sized keeps its size and look and only
+     * moves to the corner, with the corner's margins. Choosing a corner used to undo a resize.
+     */
+    val keepsInsetSize: Boolean = false
 ) {
     init {
         require(slots.isNotEmpty()) { "A preset needs at least one slot" }
@@ -50,12 +55,19 @@ fun CompositionLayout.applyPreset(preset: LayoutPreset): CompositionLayout {
     val ordered = layers.sortedBy { it.z }
     val newLayers = ordered.mapIndexed { index, layer ->
         val slot = preset.slots.getOrNull(index)
-        if (slot == null) {
+        when {
             // Also park it full-frame. Keeping the old rectangle meant a later swap moved the
             // visible layer into a stale inset rectangle, which looked like the swap was broken.
-            layer.copy(visible = false, rect = LayerRect.FULL)
-        } else {
-            layer.copy(
+            slot == null -> layer.copy(visible = false, rect = LayerRect.FULL)
+
+            preset.keepsInsetSize && index > 0 && layer.visible && layer.rect.isInset() ->
+                layer.copy(rect = layer.rect.anchoredLike(slot.rect), z = index)
+
+            // Already where the slot puts it: only the place was asked for, not a new look
+            preset.keepsInsetSize && layer.visible && layer.rect.matches(slot.rect) ->
+                layer.copy(z = index)
+
+            else -> layer.copy(
                 rect = slot.rect,
                 scaleMode = slot.scaleMode,
                 z = index,
@@ -65,6 +77,23 @@ fun CompositionLayout.applyPreset(preset: LayoutPreset): CompositionLayout {
     }
     return copy(layers = newLayers)
 }
+
+/** An inset the operator may have sized: not a full frame, a half, or anything near. */
+private fun LayerRect.isInset() = width < INSET_MAX_SIDE && height < INSET_MAX_SIDE
+
+/**
+ * This rectangle's size, moved to the corner [corner] sits in, with [corner]'s margins, and
+ * kept inside the canvas.
+ */
+internal fun LayerRect.anchoredLike(corner: LayerRect): LayerRect {
+    val left = if (corner.centerX > 0.5f) corner.right - width else corner.left
+    val top = if (corner.centerY > 0.5f) corner.bottom - height else corner.top
+    val clampedLeft = left.coerceIn(0f, 1f - width)
+    val clampedTop = top.coerceIn(0f, 1f - height)
+    return LayerRect(clampedLeft, clampedTop, clampedLeft + width, clampedTop + height)
+}
+
+private const val INSET_MAX_SIDE = 0.9f
 
 /**
  * Swaps the draw order of two layers, keeping every rectangle where it is.
@@ -102,8 +131,15 @@ fun CompositionLayout.matchingPreset(presets: List<LayoutPreset>): LayoutPreset?
     val visible = layers.filter { it.visible }.sortedBy { it.z }
     return presets.firstOrNull { preset ->
         preset.slots.size == visible.size &&
-                visible.zip(preset.slots).all { (layer, slot) ->
-                    layer.scaleMode == slot.scaleMode && layer.rect.matches(slot.rect)
+                visible.zip(preset.slots).withIndex().all { (index, pair) ->
+                    val (layer, slot) = pair
+                    if (preset.keepsInsetSize) {
+                        // A corner is a place: any size and look of the inset, in that corner
+                        if (index == 0) layer.rect.matches(slot.rect)
+                        else layer.rect.isInset() && layer.rect.matches(layer.rect.anchoredLike(slot.rect))
+                    } else {
+                        layer.scaleMode == slot.scaleMode && layer.rect.matches(slot.rect)
+                    }
                 }
     }
 }
@@ -164,6 +200,7 @@ object CompositionPresets {
         listOf(
             LayoutSlot(LayerRect.FULL, LayerScaleMode.FILL),
             LayoutSlot(rect, LayerScaleMode.FIT)
-        )
+        ),
+        keepsInsetSize = true
     )
 }

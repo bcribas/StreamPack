@@ -59,12 +59,66 @@ class LayoutPresetTest {
 
     @Test
     fun `a picture in picture preset fills with the bottom layer and insets the top one`() {
-        val result = layoutOf("main", "pip").applyPreset(CompositionPresets.PIP_TOP_LEFT)
+        val result = layoutOf("main", "pip")
+            .applyPreset(CompositionPresets.SIDE_BY_SIDE)
+            .applyPreset(CompositionPresets.PIP_TOP_LEFT)
 
         assertEquals(LayerRect.FULL, result["main"]?.rect)
         assertEquals(LayerScaleMode.FILL, result["main"]?.scaleMode)
         assertEquals(LayerRect.PIP_TOP_LEFT, result["pip"]?.rect)
         assertEquals(LayerScaleMode.FIT, result["pip"]?.scaleMode)
+    }
+
+    /** The operator's own inset: resized, flush with the top right edge, styled. */
+    private fun sizedInset() = CompositionLayout(
+        canvasSize = canvas,
+        layers = listOf(
+            VideoLayer(id = "main", z = 0, rect = LayerRect.FULL, scaleMode = LayerScaleMode.FILL),
+            VideoLayer(
+                id = "pip", z = 1, rect = LayerRect(0.73f, 0.006f, 1f, 0.27f),
+                scaleMode = LayerScaleMode.FILL, alpha = 0.8f, mirror = true, rotationDegrees = 90
+            )
+        )
+    )
+
+    private fun assertRect(expected: LayerRect, actual: LayerRect?) {
+        requireNotNull(actual)
+        listOf(
+            expected.left to actual.left, expected.top to actual.top,
+            expected.right to actual.right, expected.bottom to actual.bottom
+        ).forEach { (e, a) -> assertEquals(e, a, 1e-4f) }
+    }
+
+    @Test
+    fun `a corner keeps the inset's size and look, and only moves it`() {
+        val result = sizedInset().applyPreset(CompositionPresets.PIP_BOTTOM_LEFT)
+
+        val corner = LayerRect.PIP_BOTTOM_LEFT
+        assertRect(LayerRect(corner.left, corner.bottom - 0.264f, corner.left + 0.27f, corner.bottom), result["pip"]?.rect)
+        val pip = result["pip"]!!
+        assertEquals(LayerScaleMode.FILL, pip.scaleMode)
+        assertEquals(0.8f, pip.alpha)
+        assertTrue(pip.mirror)
+        assertEquals(90, pip.rotationDegrees)
+        assertEquals(sizedInset()["main"], result["main"])
+    }
+
+    @Test
+    fun `from side by side, a corner uses its own size`() {
+        val result = sizedInset()
+            .applyPreset(CompositionPresets.SIDE_BY_SIDE)
+            .applyPreset(CompositionPresets.PIP_BOTTOM_RIGHT)
+
+        assertEquals(LayerRect.PIP_BOTTOM_RIGHT, result["pip"]?.rect)
+        assertEquals(LayerRect.FULL, result["main"]?.rect)
+    }
+
+    @Test
+    fun `a sized inset in a corner still reads as that corner`() {
+        val moved = sizedInset().applyPreset(CompositionPresets.PIP_TOP_LEFT)
+
+        assertEquals(CompositionPresets.PIP_TOP_LEFT, moved.matchingPreset(CompositionPresets.ALL))
+        assertEquals(null, sizedInset().matchingPreset(CompositionPresets.ALL))
     }
 
     @Test
@@ -112,7 +166,9 @@ class LayoutPresetTest {
 
     @Test
     fun `swapping order exchanges both the depth and the rectangle`() {
-        val layout = layoutOf("main", "pip").applyPreset(CompositionPresets.PIP_BOTTOM_RIGHT)
+        val layout = layoutOf("main", "pip")
+            .applyPreset(CompositionPresets.SIDE_BY_SIDE)
+            .applyPreset(CompositionPresets.PIP_BOTTOM_RIGHT)
 
         val swapped = layout.swapLayerOrder("main", "pip")
 

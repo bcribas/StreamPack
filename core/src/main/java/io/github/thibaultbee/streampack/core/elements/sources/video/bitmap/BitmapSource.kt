@@ -40,7 +40,11 @@ import kotlin.random.Random
  * Video source that streams a [Bitmap].
  */
 // TODO: move to coroutines instead of ExecutorService
-internal class BitmapSource(override val bitmap: Bitmap) : AbstractPreviewableSource(),
+internal class BitmapSource(
+    override val bitmap: Bitmap,
+    /** Noise over the picture, so a still image keeps the bitrate up; not for a layer. */
+    private val withNoise: Boolean = true
+) : AbstractPreviewableSource(),
     IVideoSourceInternal,
     ISurfaceSourceInternal,
     IBitmapSource {
@@ -53,10 +57,10 @@ internal class BitmapSource(override val bitmap: Bitmap) : AbstractPreviewableSo
     private var outputSurface: Surface? = null
     private var previewSurface: Surface? = null
 
-    private val outputExecutor = Executors.newSingleThreadScheduledExecutor()
+    private val outputExecutor = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "BitmapSource-output") }
     private var outputScheduler: Future<*>? = null
 
-    private val previewExecutor = Executors.newSingleThreadScheduledExecutor()
+    private val previewExecutor = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "BitmapSource-preview") }
     private var previewScheduler: Future<*>? = null
 
     private val _isStreamingFlow = MutableStateFlow(false)
@@ -176,7 +180,7 @@ internal class BitmapSource(override val bitmap: Bitmap) : AbstractPreviewableSo
      * that detect "offline" streams when bitrate drops too low on static content.
      */
     private fun ensureCompositedBitmapsGenerated() {
-        if (compositedBitmaps.isNotEmpty()) return
+        if (!withNoise || compositedBitmaps.isNotEmpty()) return
         
         val width = bitmap.width
         val height = bitmap.height
@@ -212,7 +216,7 @@ internal class BitmapSource(override val bitmap: Bitmap) : AbstractPreviewableSo
                 ensureCompositedBitmapsGenerated()
                 
                 val canvas = surface.lockCanvas(null) ?: return@let
-                
+
                 // Single drawBitmap call - source and noise pre-composited
                 val bitmapToDraw = if (compositedBitmaps.isNotEmpty()) {
                     compositedBitmaps.getOrNull(frameIndex % compositedBitmaps.size)?.takeIf { !it.isRecycled }
@@ -256,13 +260,18 @@ internal class BitmapSource(override val bitmap: Bitmap) : AbstractPreviewableSo
  * A factory to create a [BitmapSource].
  *
  * @param bitmap the [Bitmap] to stream.
+ * @param withNoise noise over the picture, so a still image keeps the bitrate up (an OBS scene
+ * switcher takes a near-zero bitrate for a dead stream); a layer of a composition does not need it
  */
-class BitmapSourceFactory(private val bitmap: Bitmap) : IVideoSourceInternal.Factory {
+class BitmapSourceFactory(
+    private val bitmap: Bitmap,
+    private val withNoise: Boolean = true
+) : IVideoSourceInternal.Factory {
     override suspend fun create(
         context: Context,
         dispatcherProvider: IVideoDispatcherProvider
     ): IVideoSourceInternal {
-        return BitmapSource(bitmap)
+        return BitmapSource(bitmap, withNoise)
     }
 
     override fun isSourceEquals(source: IVideoSourceInternal?): Boolean {
