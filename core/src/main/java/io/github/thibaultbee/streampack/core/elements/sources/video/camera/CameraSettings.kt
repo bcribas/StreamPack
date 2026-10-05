@@ -98,6 +98,17 @@ class CameraSettings internal constructor(
     val cameraId = cameraController.cameraId
 
     /**
+     * Changes the frame rate the camera delivers, with the camera running: the closest range the
+     * camera supports to [fps]. What the source was configured with comes back when it is
+     * configured again (a new session).
+     *
+     * Fewer frames are the cheapest way to cool a phone down without touching the encoder: it
+     * simply gets fewer.
+     */
+    @RequiresPermission(Manifest.permission.CAMERA)
+    suspend fun setFrameRate(fps: Int) = cameraController.setFps(fps)
+
+    /**
      * Current physical camera id.
      */
     @delegate:RequiresApi(Build.VERSION_CODES.Q)
