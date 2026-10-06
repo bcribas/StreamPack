@@ -370,6 +370,13 @@ internal class CameraController(
 
                 this@CameraController.fps = fps
 
+                // A closed camera only keeps the rate for its next session: building a request
+                // here would open the device, and the camera service then takes it from whoever
+                // holds it now, a live camera of the same app included
+                if (captureRequestBuilder == null && !isActiveFlow.value) {
+                    return@withContext
+                }
+
                 val captureRequestBuilder = getCaptureRequestBuilder()
 
                 val range = fpsRange

@@ -100,7 +100,7 @@ class CameraSettings internal constructor(
     /**
      * Changes the frame rate the camera delivers, with the camera running: the closest range the
      * camera supports to [fps]. What the source was configured with comes back when it is
-     * configured again (a new session).
+     * configured again (a new session). On a closed camera it does not open it.
      *
      * Fewer frames are the cheapest way to cool a phone down without touching the encoder: it
      * simply gets fewer.
