@@ -199,8 +199,16 @@ class SrtSink @JvmOverloads constructor(
             throw ClosedException("SrtEndpoint should be connected at this point")
         }
 
+        // The sender's pace follows what actually comes in, with room for retransmissions. The
+        // input rate used to be the configured bitrate, in bits where SRT counts bytes: the
+        // ceiling was 8 times too high (60 Mb/s for a 6 Mb/s live), so it never paced anything,
+        // and a fixed one would not follow the regulator down either. On a link that fell from
+        // 4 Mb/s to 600 kb/s this halved the losses and retransmissions (2026-10-05, bench).
         socket.setSockFlag(SockOpt.MAXBW, 0L)
-        socket.setSockFlag(SockOpt.INPUTBW, bitrate)
+        socket.setSockFlag(SockOpt.INPUTBW, 0L)
+        socket.setSockFlag(SockOpt.MININPUTBW, MIN_INPUT_BPS / 8)
+        socket.setSockFlag(SockOpt.OHEADBW, OVERHEAD_PERCENT)
+        Logger.i(TAG, "SRT pacing: input estimated (at least ${MIN_INPUT_BPS / 1000} kb/s) + $OVERHEAD_PERCENT %, configured bitrate $bitrate b/s")
     }
 
     override suspend fun stopStream() {
@@ -225,6 +233,15 @@ class SrtSink @JvmOverloads constructor(
 
     companion object {
         private const val TAG = "SrtSink"
+
+        /**
+         * The floor of the estimated input, so a new connection (and its first key frame) is not
+         * paced from nothing: what the bench was run with.
+         */
+        const val MIN_INPUT_BPS = 500_000L
+
+        /** Room over the input for retransmissions, SRT's own default. */
+        const val OVERHEAD_PERCENT = 25
 
         private const val PAYLOAD_SIZE = 1316
 
