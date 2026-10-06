@@ -114,8 +114,9 @@ sealed interface SrtLinkState {
  * second and nothing went out. When the queue is full the rest waits for the next key frame,
  * where the receiver picks up cleanly.
  *
- * A link that is connected but not flowing is replaced: no datagram accepted by the socket, or no
- * answer from the server, for [stallTimeoutMs] while there was something to send. That is what
+ * A link that is connected but not flowing is replaced: no datagram accepted by the socket, no
+ * answer from the server, or a round trip above the SRT latency (nothing arrives in time), for
+ * [stallTimeoutMs] while there was something to send. That is what
  * a router switching provider looks like: the old path keeps the socket "connected" and only a
  * new socket, on a new port, goes out the new way. [networkChanged] does the same at once.
  *
@@ -139,6 +140,17 @@ class ResilientSrtEndpoint(
     /** How many answers the server has sent on [ISinkInternal] so far (SRT ACKs), or null if unknown. */
     private val peerAnswers: (ISinkInternal) -> Long? = { sink ->
         (sink as? SrtSink)?.let { runCatching { it.metrics.packetsReadACK.toLong() }.getOrNull() }
+    },
+    /** The round trip to the server now, in ms, or null if unknown. */
+    private val roundTripMs: (ISinkInternal) -> Long? = { sink ->
+        (sink as? SrtSink)?.let { runCatching { it.metrics.rawMetrics.bstatsOrNull(false)?.msRTT?.toLong() }.getOrNull() }
+    },
+    /**
+     * The round trip above which nothing arrives in time: the SRT latency of the descriptor. A
+     * link above it for [stallTimeoutMs] is replaced; null leaves the round trip out.
+     */
+    private val roundTripLimitMs: (MediaDescriptor) -> Long? = { descriptor ->
+        runCatching { SrtMediaDescriptor(descriptor).srtUrl.latencyInMs?.toLong() }.getOrNull()
     },
 ) : IEndpointInternal, WithEndpointMetrics<Any> {
 
@@ -308,7 +320,7 @@ class ResilientSrtEndpoint(
                     lastError = merge(
                         failures.receiveAsFlow(),
                         sink.isOpenFlow.filter { !it }.map { "Connection closed" },
-                        stalls(sink, box)
+                        stalls(sink, box, roundTripLimitMs(descriptor))
                     ).first()
                 } finally {
                     sender.cancel()
@@ -426,10 +438,13 @@ class ResilientSrtEndpoint(
     }
 
     /**
-     * Emits why the link is stalled: nothing accepted by the socket, or no answer from the
-     * server, for [stallTimeoutMs] while there was something to send.
+     * Emits why the link is stalled: nothing accepted by the socket, no answer from the server,
+     * or a round trip above [roundTripLimit] (on 2026-10-05 a Wi-Fi took it from 2 to 36 s for
+     * minutes, answering just enough to look alive), for [stallTimeoutMs] while there was
+     * something to send.
      */
-    private fun stalls(sink: ISinkInternal, box: Outbox) = flow {
+    private fun stalls(sink: ISinkInternal, box: Outbox, roundTripLimit: Long?) = flow {
+        var slowSince: Long? = null
         var lastAccepted = box.acceptedBytes.get()
         var lastAnswers = peerAnswers(sink)
         var lastDemand = box.demandBytes.get()
@@ -451,10 +466,14 @@ class ResilientSrtEndpoint(
                 lastAnswers = answers
                 answeredAt = now
             }
+            val roundTrip = roundTripLimit?.let { roundTripMs(sink) }
+            slowSince = if (wanted && roundTrip != null && roundTrip > roundTripLimit!!) slowSince ?: now else null
             val limitNs = stallTimeoutMs * 1_000_000
             when {
                 now - acceptedAt >= limitNs -> emit("The socket took nothing for ${duration(stallTimeoutMs)}")
                 now - answeredAt >= limitNs -> emit("No answer from the server for ${duration(stallTimeoutMs)}")
+                slowSince?.let { now - it >= limitNs } == true ->
+                    emit("Round trip above $roundTripLimit ms for ${duration(stallTimeoutMs)} ($roundTrip ms)")
             }
         }
     }

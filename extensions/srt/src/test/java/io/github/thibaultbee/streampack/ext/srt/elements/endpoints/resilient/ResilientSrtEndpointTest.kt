@@ -81,6 +81,9 @@ class ResilientSrtEndpointTest {
         /** What the server has answered so far, for the stall watch. */
         val answers = java.util.concurrent.atomic.AtomicLong(0)
 
+        /** The round trip the stall watch reads, in ms. */
+        val roundTrip = java.util.concurrent.atomic.AtomicLong(50)
+
         /** False: the socket takes datagrams but the server answers nothing. */
         @Volatile
         var answering = true
@@ -169,6 +172,8 @@ class ResilientSrtEndpointTest {
             stallCheckMs = 50,
             maxQueuedBytes = maxQueuedBytes,
             peerAnswers = { (it as? FakeSink)?.answers?.get() },
+            roundTripMs = { (it as? FakeSink)?.roundTrip?.get() },
+            roundTripLimitMs = { 2_000 },
         )
 
     /** What [sink] got, once the sender has caught up with [count] datagrams. */
@@ -302,6 +307,58 @@ class ResilientSrtEndpointTest {
         val state = endpoint.awaitState { it is SrtLinkState.Connecting && it.everConnected }
         assertEquals("No answer from the server for 300 ms", (state as SrtLinkState.Connecting).lastError)
         endpoint.awaitState { it == SrtLinkState.Connected(2) }
+        feeder.cancel()
+        endpoint.close()
+    }
+
+    /** Writes a datagram every 10 ms until cancelled, as a live does. */
+    private fun kotlinx.coroutines.CoroutineScope.feed(endpoint: ResilientSrtEndpoint) = launch(Dispatchers.IO) {
+        var pts = 1_000L
+        while (isActive) {
+            endpoint.write(frame(pts++), AUDIO)
+            kotlinx.coroutines.delay(10)
+        }
+    }
+
+    @Test
+    fun `a round trip above the latency, kept up, replaces the link`() = runBlocking {
+        val sinks = mutableListOf<FakeSink>()
+        val endpoint = endpoint({ FakeSink().also { sinks += it } }, stallTimeoutMs = 300)
+        endpoint.open(descriptor)
+        endpoint.startStream()
+        endpoint.awaitState { it == SrtLinkState.Connected(1) }
+        endpoint.write(frame(1, key = true), VIDEO)
+
+        // Answers still come, the socket still takes everything: only the round trip says no
+        sinks[0].roundTrip.set(36_000)
+        val feeder = feed(endpoint)
+        val state = endpoint.awaitState { it is SrtLinkState.Connecting && it.everConnected }
+        assertEquals(
+            "Round trip above 2000 ms for 300 ms (36000 ms)",
+            (state as SrtLinkState.Connecting).lastError
+        )
+        endpoint.awaitState { it == SrtLinkState.Connected(2) }
+        feeder.cancel()
+        endpoint.close()
+    }
+
+    @Test
+    fun `a short spike of the round trip is not a stall`() = runBlocking {
+        val sinks = mutableListOf<FakeSink>()
+        val endpoint = endpoint({ FakeSink().also { sinks += it } }, stallTimeoutMs = 400)
+        endpoint.open(descriptor)
+        endpoint.startStream()
+        endpoint.awaitState { it == SrtLinkState.Connected(1) }
+        endpoint.write(frame(1, key = true), VIDEO)
+        val feeder = feed(endpoint)
+
+        repeat(3) {
+            sinks[0].roundTrip.set(5_000)
+            kotlinx.coroutines.delay(200)
+            sinks[0].roundTrip.set(80)
+            kotlinx.coroutines.delay(200)
+        }
+        assertEquals(SrtLinkState.Connected(1), endpoint.linkStateFlow.value)
         feeder.cancel()
         endpoint.close()
     }
