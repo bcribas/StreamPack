@@ -27,6 +27,7 @@ import io.github.thibaultbee.streampack.core.elements.data.Frame
 import io.github.thibaultbee.streampack.core.elements.data.RawFrame
 import io.github.thibaultbee.streampack.core.elements.encoders.EncoderMode
 import io.github.thibaultbee.streampack.core.elements.encoders.EncoderStats
+import io.github.thibaultbee.streampack.core.elements.encoders.OutputFpsMeter
 import io.github.thibaultbee.streampack.core.elements.encoders.IEncoderInternal
 import io.github.thibaultbee.streampack.core.elements.encoders.mediacodec.extensions.hasEndOfStreamFlag
 import io.github.thibaultbee.streampack.core.elements.encoders.mediacodec.extensions.isKeyFrame
@@ -94,11 +95,7 @@ internal constructor(
     private val encoderCallback = EncoderCallback()
 
     // Stats tracking
-    private var outputFrameCount = 0L
-    private var outputFramesInWindow = 0
-    private var windowStartTimeMs = 0L
-    private var currentOutputFps = 0f
-    private val statsWindowMs = 1000L // 1 second window for FPS calculation
+    private val outputFps = OutputFpsMeter()
 
     init {
         val mediaCodecWithFormat = MediaCodecUtils.createCodec(encoderConfig)
@@ -126,33 +123,19 @@ internal constructor(
      * Get current encoder statistics
      */
     override fun getStats(): EncoderStats {
+        val now = System.currentTimeMillis()
         return EncoderStats(
-            outputFrameCount = outputFrameCount,
-            outputFps = currentOutputFps
+            outputFrameCount = outputFps.count,
+            outputFps = outputFps.fps(now)
         )
     }
 
     private fun trackOutputFrame() {
-        val now = System.currentTimeMillis()
-        outputFrameCount++
-        outputFramesInWindow++
-        
-        if (windowStartTimeMs == 0L) {
-            windowStartTimeMs = now
-        }
-        val elapsed = now - windowStartTimeMs
-        if (elapsed >= statsWindowMs) {
-            currentOutputFps = outputFramesInWindow * 1000f / elapsed
-            outputFramesInWindow = 0
-            windowStartTimeMs = now
-        }
+        outputFps.onFrame(System.currentTimeMillis())
     }
 
     private fun resetStats() {
-        outputFrameCount = 0
-        outputFramesInWindow = 0
-        windowStartTimeMs = 0
-        currentOutputFps = 0f
+        outputFps.reset()
     }
 
     private fun configureUnsafe() {

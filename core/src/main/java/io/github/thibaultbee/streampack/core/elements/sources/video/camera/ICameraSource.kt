@@ -18,6 +18,7 @@ package io.github.thibaultbee.streampack.core.elements.sources.video.camera
 import io.github.thibaultbee.streampack.core.elements.sources.video.IPreviewableSource
 import io.github.thibaultbee.streampack.core.elements.sources.video.IVideoSource
 import io.github.thibaultbee.streampack.core.elements.sources.video.IVideoSourceInternal
+import kotlinx.coroutines.flow.StateFlow
 
 interface ICameraSource : IVideoSource, IPreviewableSource {
     /**
@@ -29,6 +30,13 @@ interface ICameraSource : IVideoSource, IPreviewableSource {
      * The camera settings (auto-exposure, auto-focus, etc.).
      */
     val settings: CameraSettings
+
+    /**
+     * Why the camera is away, while the system has taken it (the lock screen's face unlock, the
+     * camera app) and it is being got back; null while it delivers. Meanwhile the source still
+     * counts as streaming, and a composition repeats its last frame.
+     */
+    val interruptionFlow: StateFlow<String?>
 }
 
 interface ICameraSourceInternal : IVideoSourceInternal

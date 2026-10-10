@@ -96,6 +96,8 @@ internal class CameraSource(
     private val _isPreviewingFlow = MutableStateFlow(false)
     override val isPreviewingFlow = _isPreviewingFlow.asStateFlow()
 
+    override val interruptionFlow = controller.interruptionFlow
+
     private val streamMutex = Mutex()
 
     init {
@@ -108,7 +110,9 @@ internal class CameraSource(
 
         coroutineScope.launch {
             controller.isActiveFlow.collect { isAvailable ->
-                if (!isAvailable) {
+                // A camera the system took is still wanted: the controller gets it back, and
+                // saying it stopped made the video input stop the live's picture for good
+                if (!isAvailable && !controller.isLost) {
                     _isStreamingFlow.emit(false)
                     _isPreviewingFlow.emit(false)
                 }

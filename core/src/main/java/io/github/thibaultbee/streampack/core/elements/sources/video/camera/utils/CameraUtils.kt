@@ -30,6 +30,7 @@ import io.github.thibaultbee.streampack.core.elements.sources.video.camera.contr
 import io.github.thibaultbee.streampack.core.elements.sources.video.camera.extensions.targetFps
 import io.github.thibaultbee.streampack.core.elements.sources.video.camera.sessioncompat.ICameraCaptureSessionCompat
 import io.github.thibaultbee.streampack.core.logger.Logger
+import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
@@ -56,11 +57,8 @@ internal object CameraUtils {
             }
 
             override fun onDisconnected(camera: CameraDevice) {
-                try {
-                    continuation.resumeWithException(RuntimeException("Camera has been disconnected"))
-                } catch (t: Throwable) {
-                    Logger.e(TAG, "Error while resuming with exception: $t")
-                }
+                // Once open, the continuation is long done: only an open still waiting fails
+                resumeOnce(continuation, RuntimeException("Camera has been disconnected"))
                 isClosedFlow.tryEmit(true)
                 Logger.w(TAG, "Camera ${camera.id} has been disconnected")
                 camera.close()
@@ -77,14 +75,11 @@ internal object CameraUtils {
                     ERROR_CAMERA_SERVICE -> CameraException("Camera service has crashed")
                     else -> CameraException("Unknown error")
                 }
-                try {
-                    continuation.resumeWithException(exception)
-                } catch (t: Throwable) {
-                    Logger.e(TAG, "Error while resuming with exception: $t")
-                }
+                resumeOnce(continuation, exception)
+                // Before the closed flag: whoever watches it reads why
+                throwableFlow.tryEmit(exception)
                 isClosedFlow.tryEmit(true)
                 camera.close()
-                throwableFlow.tryEmit(exception)
             }
 
             override fun onClosed(camera: CameraDevice) {
@@ -95,11 +90,21 @@ internal object CameraUtils {
         try {
             sessionCompat.openCamera(manager, cameraId, callbacks)
         } catch (t: Throwable) {
-            try {
-                continuation.resumeWithException(CameraException("Failed to open camera $cameraId: $t"))
-            } catch (t: Throwable) {
-                Logger.e(TAG, "Error while resuming with exception: $t")
-            }
+            resumeOnce(continuation, CameraException("Failed to open camera $cameraId: $t"))
+        }
+    }
+
+    /**
+     * Fails an open that is still waiting. A failed open is reported twice, by the call and by
+     * the device's callback on another thread, so checking first is not enough: the second one
+     * must not throw (it killed the app on 2026-10-10 while the camera app held the camera).
+     */
+    private fun resumeOnce(continuation: CancellableContinuation<CameraDevice>, t: Throwable) {
+        if (!continuation.isActive) return
+        try {
+            continuation.resumeWithException(t)
+        } catch (e: IllegalStateException) {
+            Logger.d(TAG, "Open already settled: ${t.message}")
         }
     }
 
